@@ -34,6 +34,7 @@ class BacklogCollector(Collector):
         gauges = {
             "credit_processing": ("Credits accepted but not settled", stats.processing),
             "credit_unpublished": ("Credits not yet confirmed by the broker", stats.unpublished),
+            "credit_parked": ("Credits parked after repeated crashes", stats.parked),
             "credit_failed": ("Credits that failed permanently", stats.failed),
             "credit_oldest_processing_age_seconds": (
                 "Age of the oldest unsettled credit",

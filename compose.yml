@@ -39,7 +39,9 @@ services:
   mongo:
     # 8.0.x refuses to start on Linux kernel >= 6.19 (SERVER-121912); 8.2 runs fine.
     image: mongo:8.2
-    command: ["--replSet", "rs0", "--bind_ip_all"]
+    # Transactions take milliseconds; abort ones abandoned by a killed client after 15s
+    # (default 60s) so they don't hold locks and stall recovery for a full minute.
+    command: ["--replSet", "rs0", "--bind_ip_all", "--setParameter", "transactionLifetimeLimitSeconds=15"]
     ports:
       - "27017:27017"
     volumes:

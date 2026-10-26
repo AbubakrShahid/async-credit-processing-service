@@ -78,11 +78,12 @@ location: /credits/cr_09c88385ea4a4193885f78f8caf8bbf3
   "error": null,
   "created_at": "2026-10-26T12:37:38.351000Z",
   "processed_at": "2026-10-26T12:37:38.359000Z",
-  "published_at": "2026-10-26T12:37:38.357000Z"
+  "published_at": "2026-10-26T12:37:38.357000Z",
+  "parked_at": null
 }
 ```
 
-`status` is `processing`, `processed` (the balance has been updated) or `failed` (the balance was not changed, and `error` says why). `published_at` is when RabbitMQ confirmed the message.
+`status` is `processing`, `processed` (the balance has been updated) or `failed` (the balance was not changed, and `error` says why). `published_at` is when RabbitMQ confirmed the message. `parked_at` is set if the credit was put on hold for an operator (see the failure policy below).
 
 ### `GET /users/{user_id}`: balance
 
@@ -94,7 +95,8 @@ location: /credits/cr_09c88385ea4a4193885f78f8caf8bbf3
 
 - `GET /health/live`: returns 200 while the process is running. It doesn't check any dependencies.
 - `GET /health/ready`: checks MongoDB and RabbitMQ. It returns 503 if either one can't be reached.
-- `GET /metrics`: Prometheus metrics. These gauges are read from MongoDB, so they cover every process: `credit_processing`, `credit_unpublished`, `credit_failed`, `credit_oldest_processing_age_seconds`, `credit_oldest_unpublished_age_seconds` and `credit_queue_depth`. There is also an HTTP latency histogram. Alert on the oldest-age gauges and on `credit_failed` going up.
+- `GET /metrics`: Prometheus metrics. These gauges are read from MongoDB, so they cover every process: `credit_processing`, `credit_unpublished`, `credit_parked`, `credit_failed`, `credit_oldest_processing_age_seconds`, `credit_oldest_unpublished_age_seconds` and `credit_queue_depth`. There is also an HTTP latency histogram. Alert on the oldest-age gauges, and on `credit_parked` or `credit_failed` going up.
+- **Releasing parked credits:** once the cause is understood, run `docker compose exec api python -m credit_service.unpark <task_id> [...]`. The dispatcher republishes them with a fresh crash budget.
 
 ## How it works
 
@@ -103,7 +105,7 @@ location: /credits/cr_09c88385ea4a4193885f78f8caf8bbf3
 3. **Dispatch.** Every 15s, Celery beat runs the dispatcher. It claims due credits in batches of 500, oldest first. Each claim gets a unique token and a 60s lease, so two dispatchers can't take the same credit. It keeps going until nothing is due, for up to 10s per run. There are two kinds of due credits:
    - **Never confirmed by the broker:** published after a 10s grace period. This covers a broker outage and an API crash between commit and publish.
    - **Confirmed but still unprocessed after 15 minutes:** republished **only while the queue is (nearly) empty**. When the queue is deep, the message is almost certainly still waiting in it, and republishing would only make the backlog worse.
-4. **Failure policy.** Infrastructure errors **never** fail a credit. Transient MongoDB errors are retried up to 5 times with exponential backoff and jitter; after that the dispatcher picks the credit up again. A business error, such as the user having been deleted, fails the credit immediately. An execution that crashes the worker is counted as a crash: RabbitMQ marks the redelivered message, and the earlier execution never finished. An unexpected exception also counts as a crash. After 3 crashes the credit is marked `failed`. A failed credit leaves the balance unchanged and releases its `pending_credits`.
+4. **Failure policy.** Infrastructure errors **never** fail a credit. Transient MongoDB errors are retried up to 5 times with exponential backoff and jitter; after that the dispatcher picks the credit up again. Transactions are also retried in place for up to 120s by the MongoDB driver. A business error, such as the user having been deleted, fails the credit immediately. An execution that crashes the worker is counted as a crash: RabbitMQ marks the redelivered message, and the earlier execution never finished. An unexpected exception also counts as a crash. After 10 crashes the credit is **parked, not failed**: it stays `processing` (the money is still owed), stops being retried automatically, and waits for an operator. A crash loop can't tell a bad message from a restart loop, and a restart loop must not make users lose money. A failed credit leaves the balance unchanged and releases its `pending_credits`.
 
 ## Tests
 
@@ -112,7 +114,7 @@ The integration tests run against real MongoDB and RabbitMQ, because transaction
 ```bash
 uv sync
 make up            # or just: docker compose up -d --wait mongo rabbitmq
-make check         # ruff + mypy --strict + all 85 tests (about 8s)
+make check         # ruff + mypy --strict + all 88 tests (about 9s)
 make test-unit     # no infrastructure needed
 ```
 
@@ -129,7 +131,7 @@ make test-unit     # no infrastructure needed
 | Dispatcher dies after publish, before recording it | Injected failure | Republished once more; credited once |
 | Deep queue with old confirmed credits | Queue depth set to unknown, 5,000, or 0 | Republished only when the queue is drained |
 | Long MongoDB outage (20 transient failures) | Repeated failures | Never marked failed; applied once the database is back |
-| Poison message: repeated crashes or unexpected errors | Simulated redeliveries | `failed` after 3; balance unchanged |
+| Crash loop: repeated crashes or unexpected errors | Simulated redeliveries | **Parked** (still owed, balance unchanged); skipped by the dispatcher; applied once released |
 | Client retries; same key with a different body; same key from another client | API | Same credit / `409` / a separate credit |
 | Too many credits in flight for one user; queue backlogged | API | `429` / `503`; nothing saved |
 | 40 parallel submit+apply; 30 credits through an 8-thread worker | Threads, real worker | Exact to the cent; **invariants checked from snapshots while processing runs** |
@@ -137,12 +139,20 @@ make test-unit     # no infrastructure needed
 
 The key guards were checked by breaking them on purpose. Removing the `processing` guard, ignoring the redelivered flag, republishing regardless of queue depth, or counting transient errors as crashes each makes the matching tests fail.
 
-Also checked by hand on the Docker stack:
-- **RabbitMQ stopped while 2,000 credits came in:** all 2,000 got `202` in 5s, and all were applied within 9s of RabbitMQ coming back.
-- **Workers stopped with 3,000 credits queued:** nothing was republished past the threshold, and there were 0 duplicate deliveries once the workers came back.
+Also checked by hand on the Docker stack. Each drill ended with every balance exact, every `pending_credits` correct, and 0 credits failed, parked or stuck:
+
+| Drill | Result |
+|---|---|
+| RabbitMQ stopped while 2,000 credits arrive | All got `202` in about 6s; all applied within 10s of RabbitMQ returning |
+| RabbitMQ restarted with 500 messages queued (workers stopped) | All 500 survived the restart and were applied (durable queue, persistent messages) |
+| Worker `SIGKILL`ed 6 times while processing 8,000 credits | All applied in 17s after the last restart; 10 credits really crashed mid-processing and were still applied once |
+| MongoDB killed for 30s, then for 150s, while processing | Workers paused, then resumed on their own; all applied |
+| MongoDB restarted | Balances identical before and after |
+| Workers stopped with 3,000 credits queued | Nothing republished past the threshold; 0 duplicate deliveries |
 
 ## Decisions and assumptions
 
+- **Durability is pinned in the code, not inherited from the cluster:** writes are acknowledged only after a majority has journaled them (`w: majority, j: true`), and transactions read at `snapshot`. Every MongoDB operation has a 10s client-side timeout, so a server that vanishes can't hang a worker on a dead connection.
 - **Money uses `Decimal`** in Python and `Decimal128` in MongoDB, never floats. The API returns money as strings (`"150.00"`). The example in the brief shows a number, so this is a deliberate difference.
 - **Credits for unknown users are rejected** with `404`. Accounts aren't created implicitly. `make seed` creates demo users.
 - **Each credit has its own status in `credit_operations`, and that is the authoritative status.** The user's `status` is `processing` while any credit is in flight. Once none are, it shows the outcome of the last one to finish.
@@ -165,12 +175,13 @@ These environment variables are read by the API, the worker and beat. Local runs
 | Variable | Default | Purpose |
 |---|---|---|
 | `MONGO_URI` / `MONGO_DB` | localhost replica set / `credit_service` | Must point to a replica set (needed for transactions) |
+| `MONGO_OPERATION_TIMEOUT_MS` | `10000` | Upper bound on each MongoDB operation |
 | `BROKER_URL` / `CREDITS_QUEUE` | local RabbitMQ / `credits` | |
 | `API_KEYS` | empty (auth off) | `client:key,...`; compose sets `reviewer:local-dev-key` |
 | `MAX_PENDING_PER_USER` / `MAX_QUEUE_DEPTH` | `1000` / `100000` | Admission limits (`429` / `503`) |
 | `PUBLISH_PAUSE_SECONDS` | `5` | How long the API stops publishing after a failed publish |
 | `TASK_MAX_RETRIES` / `RETRY_BACKOFF_SECONDS` / `RETRY_BACKOFF_MAX_SECONDS` | `5` / `1` / `60` | Retries for transient errors |
-| `MAX_CRASHES` / `TASK_TIME_LIMIT_SECONDS` | `3` / `300` | Crash budget for poison messages, and the hard time limit per task |
+| `MAX_CRASHES` / `TASK_TIME_LIMIT_SECONDS` | `10` / `300` | Crashes before a credit is parked for an operator, and the hard time limit per task |
 | `DISPATCH_INTERVAL_SECONDS` / `DISPATCH_TIME_BUDGET_SECONDS` / `DISPATCH_BATCH_SIZE` | `15` / `10` / `500` | How often the dispatcher runs, how long each run may take, and the batch size |
 | `PUBLISH_GRACE_SECONDS` / `REPUBLISH_AFTER_SECONDS` / `RECONCILE_MAX_QUEUE_DEPTH` | `10` / `900` / `100` | When unconfirmed and confirmed credits become due, and the queue depth below which confirmed credits may be republished |
 | `DISPATCH_LEASE_SECONDS` | `60` | How long a dispatcher's claim lasts |
@@ -186,6 +197,7 @@ src/credit_service/
   worker.py         Celery tasks: apply_credit, dispatch_pending_credits
   celery_app.py     Celery/RabbitMQ configuration, publishing, queue-depth probe
   money.py          amount parsing and validation
+  unpark.py         operator command that releases parked credits
   db.py, models.py, errors.py, config.py, observability.py, seed.py
 tests/unit/         pure logic: money, backoff, error classification
 tests/integration/  real MongoDB + RabbitMQ, including an in-process Celery worker

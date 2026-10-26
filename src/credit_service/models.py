@@ -16,6 +16,7 @@ class CreditStatus(StrEnum):
 class ApplyOutcome(StrEnum):
     APPLIED = "applied"
     FAILED = "failed"
+    PARKED = "parked"
     ALREADY_SETTLED = "already_settled"
     NOT_FOUND = "not_found"
 
@@ -32,6 +33,7 @@ class CreditOperation:
     updated_at: datetime
     processed_at: datetime | None
     published_at: datetime | None
+    parked_at: datetime | None
 
     @classmethod
     def from_document(cls, doc: Document) -> Self:
@@ -46,6 +48,7 @@ class CreditOperation:
             updated_at=doc["updated_at"],
             processed_at=doc.get("processed_at"),
             published_at=doc.get("published_at"),
+            parked_at=doc.get("parked_at"),
         )
 
 
@@ -61,6 +64,7 @@ class BacklogStats:
 
     processing: int
     unpublished: int
+    parked: int
     failed: int
     oldest_processing_age_seconds: float
     oldest_unpublished_age_seconds: float

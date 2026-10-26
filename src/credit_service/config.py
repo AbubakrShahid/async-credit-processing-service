@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     mongo_uri: str = "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
     mongo_db: str = "credit_service"
     mongo_timeout_ms: int = 5000
+    # Upper bound on each MongoDB operation. Without it, a server that vanishes mid-request
+    # can leave a call waiting on a dead socket indefinitely. (Transactions are additionally
+    # retried in place by with_transaction for up to 120s before an error surfaces.)
+    mongo_operation_timeout_ms: int = 10_000
 
     broker_url: str = "amqp://guest:guest@localhost:5672//"
     credits_queue: str = "credits"
@@ -24,12 +28,14 @@ class Settings(BaseSettings):
     publish_pause_seconds: float = 5.0
 
     # Worker: transient MongoDB errors are retried with exponential backoff + full jitter
-    # and never fail a credit. Business errors fail it at once; executions that die or hit
-    # an unexpected error (poison messages) fail it after `max_crashes`.
+    # and never fail a credit. Business errors fail it at once. Executions that die or hit an
+    # unexpected error are crashes; after `max_crashes` the credit is parked (still owed,
+    # no longer retried automatically) for an operator, because a crash can't tell a
+    # poison message from infrastructure trouble such as a restart loop.
     task_max_retries: int = 5
     retry_backoff_seconds: float = 1.0
     retry_backoff_max_seconds: float = 60.0
-    max_crashes: int = 3
+    max_crashes: int = 10
     task_time_limit_seconds: int = 300
 
     # Dispatcher: publishes credits whose publish never got confirmed, and, only while the

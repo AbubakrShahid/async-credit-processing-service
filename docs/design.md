@@ -22,7 +22,7 @@ flowchart LR
 | Component | Role and key settings |
 |---|---|
 | **API** (FastAPI) | Checks admission limits, records the credit, publishes and returns `202`. Handlers are synchronous because PyMongo and Celery publishing block; FastAPI runs them in its threadpool, so the event loop is never blocked. |
-| **MongoDB** 8.2 | The source of truth. A replica set, because multi-document transactions need one; locally that's a single node. |
+| **MongoDB** 8.2 | The source of truth, as a replica set (transactions need one). Majority-journaled writes and snapshot reads are pinned in code; every operation has a 10s timeout. |
 | **RabbitMQ** | A durable queue with persistent messages and publisher confirms. Its ack and redelivery behaviour is explicit, which is why I chose it over Redis. |
 | **Worker** (Celery) | `acks_late`, `reject_on_worker_lost`, `prefetch=1`, and a hard time limit: a message is only removed after the credit has committed. |
 | **Beat** | Triggers the dispatcher every 15s; concurrent runs are safe. |
@@ -52,27 +52,22 @@ A single `status` on the user can't describe two credits in flight at once. So t
 | Broker down / message lost / API dies after commit | The dispatcher publishes the credit after the grace period, or reconciles it once the queue is drained. |
 | Client retries the POST | An `Idempotency-Key`, unique per client and stored with a request fingerprint: the same body returns the original credit, a different body gets `409`. |
 | MongoDB outage, however long | Retried with backoff and jitter, then picked up again by the dispatcher. **Infrastructure errors never fail a credit.** |
-| User deleted before apply / poison message | A business error fails the credit at once. A crash counts when RabbitMQ marks a message as redelivered and the previous run never finished; an unexpected exception also counts. After 3, the credit is marked `failed`, its balance untouched and its pending slot released. |
+| User deleted before apply / crash loop | A business error fails the credit at once, leaving the balance untouched. A crash counts when RabbitMQ redelivers a message whose previous run never finished, or on an unexpected exception. After 10, the credit is **parked, not failed**: it stays owed, isn't retried and shows in `/metrics` until an operator releases it, because a restart loop looks exactly like a poison message. |
 
 ## 6. Testing and verification
 
-The 85 tests run against **real MongoDB and RabbitMQ**, because transactions, write conflicts and redelivery are exactly what's being tested, and mocks would only repeat my own assumptions. Each failure in §5 is reproduced by injecting it at the boundary where it happens:
-
-- a real consumer takes a message, commits, and drops its connection without acking;
-- a commit succeeds and then reports `UnknownTransactionCommitResult`;
-- a dispatcher dies after publishing but before recording it;
-- the queue depth is forced to show a backlog.
+The 88 tests run against **real MongoDB and RabbitMQ**, because transactions, write conflicts and redelivery are exactly what's being tested, and mocks would only repeat my own assumptions. Each failure in §5 is reproduced at the boundary where it happens: a real consumer commits and drops its connection without acking; a commit succeeds and then reports `UnknownTransactionCommitResult`; a dispatcher dies between publishing and recording; the queue depth is forced to show a backlog. CI runs ruff, `mypy --strict`, the tests, an image build and a smoke test.
 
 Concurrency tests read snapshot transactions *while processing runs* to check that the balance always equals the opening balance plus processed credits, and that `pending_credits` always equals the number of credits in flight. Each key guard was broken on purpose and its tests failed. Drills on the Docker stack:
 
-- RabbitMQ down while 2,000 credits arrived: all got `202` in 5s, and all were applied within 9s of RabbitMQ returning.
+- RabbitMQ down while 2,000 credits arrived: all got `202`, all applied within 10s of its return; restarted with 500 queued: none lost.
+- Worker `SIGKILL`ed 6 times while processing 8,000 credits; MongoDB killed for 30s and for 150s: all applied, none failed or stuck.
 - 3,000 credits queued behind stopped workers: no republishing, and 0 duplicate deliveries.
 
-CI runs ruff, `mypy --strict`, the tests, an image build and a smoke test.
 
 ## 7. Trade-offs, limits and production deployment
 
 - **A very busy single account is a bottleneck.** Every credit writes the same user document (about 100–150/s per account on a laptop), and `429` keeps its backlog bounded. A ledger with a computed balance would remove this limit, but it changes the `balance` contract the brief asks for, so I documented it rather than building it.
-- **Throughput:** about 315 requests/s on a laptop with one API process and 4 workers. That isn't a capacity claim: everything scales horizontally, and production numbers need benchmarking on production hardware.
+- **Throughput:** about 315 requests/s on a laptop (1 API process, 4 workers). That isn't a capacity claim: everything scales horizontally, and production needs its own benchmark.
 - **Deployment:** a 3-node replica set with majority writes, RabbitMQ quorum queues, several API and worker instances, and secrets and TLS for the real credentials.
-- **Operations:** `/metrics` exposes backlog gauges read from MongoDB, so they're correct across every process: credits in flight, unpublished credits, failed credits, the oldest age of each, and queue depth. Alert on the oldest-age gauges and on `failed` going up. Credit records are the audit trail: archive them by retention policy, never by TTL, and reconcile balances against processed credits.
+- **Operations:** `/metrics` gauges are read from MongoDB, so they cover every process: in flight, unpublished, parked and failed credits, the oldest ages and queue depth. Alert on the ages and on parked or failed credits. Credit records are the audit trail: archive them, never expire them with a TTL, and reconcile balances against them.

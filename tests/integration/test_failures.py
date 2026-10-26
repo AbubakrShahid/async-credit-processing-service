@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from pymongo.database import Database
@@ -73,7 +74,7 @@ def test_concurrent_duplicate_is_not_mistaken_for_a_crash(
     assert operation_of(db, operation.task_id)["crashes"] == 0
 
 
-def test_poison_message_fails_after_crash_budget_without_touching_balance(
+def test_crash_loop_parks_the_credit_instead_of_failing_it(
     make_service: Callable[..., CreditService],
     repository: CreditRepository,
     db: Database[Document],
@@ -83,21 +84,21 @@ def test_poison_message_fails_after_crash_budget_without_touching_balance(
     make_user("u_123", balance=Decimal("100.00"))
     operation = service.submit_credit("u_123", Decimal("10"))
 
-    # Each execution dies mid-flight; RabbitMQ redelivers the unacked message.
+    # Each execution dies mid-flight; RabbitMQ redelivers the unacked message. That looks
+    # the same whether the message is poison or the worker is in a restart loop.
     repository.start_attempt(operation.task_id, redelivered=False)
     repository.start_attempt(operation.task_id, redelivered=True)  # crash 1
 
-    assert service.apply_credit(operation.task_id, redelivered=True) is ApplyOutcome.FAILED
+    assert service.apply_credit(operation.task_id, redelivered=True) is ApplyOutcome.PARKED
 
     stored = operation_of(db, operation.task_id)
-    assert stored["status"] == "failed"
-    assert stored["error"] == "processing crashed 2 times; giving up"
+    assert stored["status"] == "processing"  # still owed to the user
+    assert stored["parked_at"] is not None
+    assert stored["error"] == "processing crashed 2 times; parked for review"
     user = user_of(db, "u_123")
-    assert (user["balance"], user["status"], user["pending_credits"]) == (
-        Decimal("100.00"),
-        "failed",
-        0,
-    )
+    assert (user["balance"], user["pending_credits"]) == (Decimal("100.00"), 1)
+    # Further deliveries leave it alone.
+    assert service.apply_credit(operation.task_id, redelivered=True) is ApplyOutcome.PARKED
 
 
 def test_unexpected_errors_count_towards_the_crash_budget(
@@ -114,7 +115,32 @@ def test_unexpected_errors_count_towards_the_crash_budget(
         repository.start_attempt(operation.task_id, redelivered=False)
         service.record_failed_attempt(operation.task_id, KeyError("bug"), transient=False)
 
-    assert service.apply_credit(operation.task_id) is ApplyOutcome.FAILED
+    assert service.apply_credit(operation.task_id) is ApplyOutcome.PARKED
+
+
+def test_parked_credit_is_released_by_an_operator_and_then_applied(
+    make_service: Callable[..., CreditService],
+    repository: CreditRepository,
+    db: Database[Document],
+    make_user: Callable[..., str],
+) -> None:
+    published: list[str] = []
+    service = make_service(published.append, queue_depth=lambda: 0, max_crashes=1)
+    make_user("u_123", balance=Decimal("100.00"))
+    operation = service.submit_credit("u_123", Decimal("10"))
+    repository.start_attempt(operation.task_id, redelivered=False)
+    service.apply_credit(operation.task_id, redelivered=True)  # parked
+    db.credit_operations.update_one(  # due for dispatch, if parking didn't stop it
+        {"_id": operation.task_id}, {"$set": {"next_dispatch_at": datetime.now(UTC)}}
+    )
+    published.clear()
+
+    assert service.dispatch_pending().published == 0  # the dispatcher leaves parked credits alone
+    assert service.unpark_credit(operation.task_id)
+    assert service.dispatch_pending().published == 1
+    assert service.apply_credit(published[0]) is ApplyOutcome.APPLIED
+    assert user_of(db, "u_123")["balance"] == Decimal("110.00")
+    assert not service.unpark_credit(operation.task_id)  # nothing left to release
 
 
 def test_failed_credit_is_final(

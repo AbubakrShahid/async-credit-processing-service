@@ -90,17 +90,23 @@ class CreditService:
         """Apply a credit. Transient MongoDB errors propagate so the caller can retry.
 
         Failure policy: infrastructure errors never fail a credit (it is retried until
-        MongoDB is back); a business error fails it immediately; an execution that keeps
-        crashing the worker or raising unexpected errors fails it after `max_crashes`.
+        MongoDB is back); a business error fails it immediately; a credit whose processing
+        keeps crashing is parked for an operator rather than failed, because repeated crashes
+        are as likely to be a restart loop as a poison message, and the money is still owed.
         """
         state = self._repository.start_attempt(task_id, redelivered=redelivered)
         if state is None:
-            exists = self._repository.get_operation(task_id) is not None
-            if not exists:
+            operation = self._repository.get_operation(task_id)
+            if operation is None:
                 logger.warning("credit_not_found", task_id=task_id)
-            return ApplyOutcome.ALREADY_SETTLED if exists else ApplyOutcome.NOT_FOUND
+                return ApplyOutcome.NOT_FOUND
+            parked = operation.parked_at is not None and operation.status == "processing"
+            return ApplyOutcome.PARKED if parked else ApplyOutcome.ALREADY_SETTLED
         if state.crashes >= self._settings.max_crashes:
-            return self._fail(task_id, f"processing crashed {state.crashes} times; giving up")
+            reason = f"processing crashed {state.crashes} times; parked for review"
+            logger.error("credit_parked", task_id=task_id, reason=reason)
+            self._repository.park_credit(task_id, reason)
+            return ApplyOutcome.PARKED
 
         try:
             return self._repository.apply_credit(task_id)
@@ -114,6 +120,11 @@ class CreditService:
             self._repository.end_attempt(task_id, repr(exc), crashed=not transient)
         except PyMongoError:
             logger.warning("attempt_not_recorded", task_id=task_id, exc_info=True)
+
+    def unpark_credit(self, task_id: str) -> bool:
+        unparked = self._repository.unpark_credit(task_id)
+        logger.warning("credit_unparked", task_id=task_id, unparked=unparked)
+        return unparked
 
     def _fail(self, task_id: str, reason: str) -> ApplyOutcome:
         logger.error("credit_failed", task_id=task_id, reason=reason)

@@ -113,6 +113,7 @@ def dispatch_pending_credits() -> int:
         reconciled=report.reconciled,
         broker_available=report.broker_available,
         unpublished=stats.unpublished,
+        parked=stats.parked,
         oldest_unpublished_age_s=round(stats.oldest_unpublished_age_seconds, 1),
         processing=stats.processing,
         oldest_processing_age_s=round(stats.oldest_processing_age_seconds, 1),

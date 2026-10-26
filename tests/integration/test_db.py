@@ -28,3 +28,8 @@ def test_writes_require_majority_journaled_acknowledgement(
 ) -> None:
     # Durability must not depend on whatever default the cluster happens to have.
     assert mongo_client.write_concern.document == {"w": "majority", "j": True}
+
+
+def test_every_operation_is_bounded_by_a_timeout(mongo_client: MongoClient[Document]) -> None:
+    # A vanished server must surface as a (retryable) timeout, not hang a worker forever.
+    assert mongo_client.options.timeout == 10

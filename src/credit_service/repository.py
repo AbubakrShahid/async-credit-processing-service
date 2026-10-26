@@ -124,6 +124,7 @@ class CreditRepository:
             # Dispatch state: the API publishes right away; the dispatcher only steps in
             # if that publish isn't confirmed within the grace period.
             "published_at": None,
+            "parked_at": None,
             "dispatch_attempts": 0,
             "next_dispatch_at": now + self._publish_grace,
         }
@@ -170,7 +171,7 @@ class CreditRepository:
     # --- processing credits ------------------------------------------------------------
 
     def start_attempt(self, task_id: str, *, redelivered: bool) -> AttemptState | None:
-        """Mark an execution as in flight; None if the credit is no longer pending.
+        """Mark an execution as in flight; None if the credit is settled or parked.
 
         A crash is detected when RabbitMQ redelivers a message (the previous consumer died
         without acking) and the previous execution never finished. A concurrent duplicate
@@ -179,7 +180,7 @@ class CreditRepository:
         crashed = {"$cond": [{"$ifNull": ["$in_flight_since", False]}, 1, 0]} if redelivered else 0
         now = datetime.now(UTC)
         doc = self._operations.find_one_and_update(
-            {"_id": task_id, "status": CreditStatus.PROCESSING},
+            {"_id": task_id, "status": CreditStatus.PROCESSING, "parked_at": None},
             [
                 {
                     "$set": {
@@ -203,6 +204,38 @@ class CreditRepository:
         if crashed:
             update["$inc"] = {"crashes": 1}
         self._operations.update_one({"_id": task_id, "status": CreditStatus.PROCESSING}, update)
+
+    def park_credit(self, task_id: str, reason: str) -> None:
+        """Stop automatic processing of a credit that keeps crashing. It stays owed."""
+        self._operations.update_one(
+            {"_id": task_id, "status": CreditStatus.PROCESSING},
+            {
+                "$set": {
+                    "parked_at": datetime.now(UTC),
+                    "error": reason,
+                    "in_flight_since": None,
+                    "updated_at": datetime.now(UTC),
+                }
+            },
+        )
+
+    def unpark_credit(self, task_id: str) -> bool:
+        """Hand a parked credit back to the dispatcher with a fresh crash budget."""
+        now = datetime.now(UTC)
+        result = self._operations.update_one(
+            {"_id": task_id, "status": CreditStatus.PROCESSING, "parked_at": {"$ne": None}},
+            {
+                "$set": {
+                    "parked_at": None,
+                    "crashes": 0,
+                    "error": None,
+                    "published_at": None,
+                    "next_dispatch_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+        return result.modified_count == 1
 
     def apply_credit(self, task_id: str) -> ApplyOutcome:
         """Apply a pending credit to the user's balance at most once.
@@ -300,7 +333,11 @@ class CreditRepository:
         dies mid-batch only delays its claims until the lease runs out.
         """
         now = datetime.now(UTC)
-        due: Document = {"status": CreditStatus.PROCESSING, "next_dispatch_at": {"$lte": now}}
+        due: Document = {
+            "status": CreditStatus.PROCESSING,
+            "parked_at": None,
+            "next_dispatch_at": {"$lte": now},
+        }
         if not include_published:
             due["published_at"] = None
         candidates = [
@@ -335,7 +372,7 @@ class CreditRepository:
     def backlog_stats(self) -> BacklogStats:
         now = datetime.now(UTC)
         processing: Document = {"status": CreditStatus.PROCESSING}
-        unpublished: Document = {**processing, "published_at": None}
+        unpublished: Document = {**processing, "published_at": None, "parked_at": None}
 
         def oldest_age(query: Document) -> float:
             doc = self._operations.find_one(query, {"created_at": True}, sort=[("created_at", 1)])
@@ -344,6 +381,7 @@ class CreditRepository:
         return BacklogStats(
             processing=self._operations.count_documents(processing),
             unpublished=self._operations.count_documents(unpublished),
+            parked=self._operations.count_documents({**processing, "parked_at": {"$ne": None}}),
             failed=self._operations.count_documents({"status": CreditStatus.FAILED}),
             oldest_processing_age_seconds=oldest_age(processing),
             oldest_unpublished_age_seconds=oldest_age(unpublished),

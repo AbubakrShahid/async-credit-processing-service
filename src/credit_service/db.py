@@ -50,6 +50,7 @@ def create_client(settings: Settings) -> MongoClient[Document]:
     return MongoClient(
         settings.mongo_uri,
         serverSelectionTimeoutMS=settings.mongo_timeout_ms,
+        timeoutMS=settings.mongo_operation_timeout_ms,
         tz_aware=True,
         # Pinned rather than inherited from the cluster default: a credit is acknowledged
         # only once a majority has journaled it, so it survives a failover.
