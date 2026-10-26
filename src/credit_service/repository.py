@@ -148,6 +148,39 @@ class CreditRepository:
         with self._client.start_session() as session:
             return session.with_transaction(txn)
 
+    def record_attempt(self, task_id: str) -> int | None:
+        """Count a processing attempt; None if the credit is not pending (or unknown)."""
+        doc = self._operations.find_one_and_update(
+            {"_id": task_id, "status": CreditStatus.PROCESSING},
+            {"$inc": {"attempts": 1}, "$set": {"updated_at": datetime.now(UTC)}},
+            projection={"attempts": True},
+            return_document=ReturnDocument.AFTER,
+        )
+        return doc["attempts"] if doc else None
+
+    def fail_credit(self, task_id: str, error: str) -> bool:
+        """Mark a pending credit failed and release it from the user's pending count."""
+
+        def txn(session: ClientSession) -> bool:
+            now = datetime.now(UTC)
+            operation = self._operations.find_one_and_update(
+                {"_id": task_id, "status": CreditStatus.PROCESSING},
+                {"$set": {"status": CreditStatus.FAILED, "error": error, "updated_at": now}},
+                session=session,
+            )
+            if operation is None:
+                return False
+            # The user may be gone, which is often why we are failing; that's fine.
+            self._users.update_one(
+                {"user_id": operation["user_id"]},
+                settle_user_pipeline(CreditStatus.FAILED, now),
+                session=session,
+            )
+            return True
+
+        with self._client.start_session() as session:
+            return session.with_transaction(txn)
+
     def get_operation(self, task_id: str) -> CreditOperation | None:
         doc = self._operations.find_one({"_id": task_id})
         return CreditOperation.from_document(doc) if doc else None

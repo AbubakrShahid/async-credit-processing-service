@@ -5,6 +5,7 @@ from bson import Decimal128
 from bson.codec_options import CodecOptions, TypeCodec, TypeRegistry
 from pymongo import ASCENDING, MongoClient
 from pymongo.database import Database
+from pymongo.errors import ConnectionFailure, ExecutionTimeout, PyMongoError, WTimeoutError
 
 from credit_service.config import Settings
 
@@ -27,6 +28,22 @@ class DecimalCodec(TypeCodec):
 CODEC_OPTIONS: CodecOptions[Document] = CodecOptions(
     tz_aware=True, type_registry=TypeRegistry([DecimalCodec()])
 )
+
+
+TRANSIENT_ERROR_LABELS = (
+    "TransientTransactionError",
+    "UnknownTransactionCommitResult",
+    "RetryableWriteError",
+)
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Errors worth retrying: network blips, failovers, timeouts, write conflicts."""
+    if isinstance(exc, ConnectionFailure | ExecutionTimeout | WTimeoutError):
+        return True
+    return isinstance(exc, PyMongoError) and any(
+        exc.has_error_label(label) for label in TRANSIENT_ERROR_LABELS
+    )
 
 
 def create_client(settings: Settings) -> MongoClient[Document]:

@@ -14,9 +14,12 @@ type Enqueue = Callable[[str], None]
 class CreditService:
     """Credit workflows shared by the API and the worker. No FastAPI or Celery in here."""
 
-    def __init__(self, repository: CreditRepository, enqueue: Enqueue) -> None:
+    def __init__(
+        self, repository: CreditRepository, enqueue: Enqueue, max_attempts: int = 10
+    ) -> None:
         self._repository = repository
         self._enqueue = enqueue
+        self._max_attempts = max_attempts
 
     def submit_credit(
         self, user_id: str, amount: Decimal, idempotency_key: str | None = None
@@ -33,10 +36,25 @@ class CreditService:
         return operation
 
     def apply_credit(self, task_id: str) -> ApplyOutcome:
-        outcome = self._repository.apply_credit(task_id)
+        """Apply a credit. Transient MongoDB errors propagate so the caller can retry."""
+        attempts = self._repository.record_attempt(task_id)
+        if attempts is not None and attempts > self._max_attempts:
+            return self._fail(task_id, f"gave up after {self._max_attempts} attempts")
+
+        try:
+            outcome = self._repository.apply_credit(task_id)
+        except UserNotFoundError as exc:
+            # The user was deleted after the credit was accepted; retrying won't help.
+            return self._fail(task_id, str(exc))
+
         if outcome is ApplyOutcome.NOT_FOUND:
             logger.warning("Credit %s does not exist; dropping task", task_id)
         return outcome
+
+    def _fail(self, task_id: str, reason: str) -> ApplyOutcome:
+        logger.error("Credit %s failed: %s", task_id, reason)
+        self._repository.fail_credit(task_id, reason)
+        return ApplyOutcome.FAILED
 
     def get_credit(self, task_id: str) -> CreditOperation:
         operation = self._repository.get_operation(task_id)

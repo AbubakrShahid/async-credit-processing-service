@@ -13,6 +13,13 @@ class Settings(BaseSettings):
     broker_url: str = "amqp://guest:guest@localhost:5672//"
     credits_queue: str = "credits"
 
+    # Celery retries for transient MongoDB errors, with exponential backoff + full jitter.
+    task_max_retries: int = 5
+    retry_backoff_seconds: float = 1.0
+    retry_backoff_max_seconds: float = 60.0
+    # Hard cap across retries, redeliveries and requeues before a credit is marked failed.
+    max_attempts: int = 10
+
     log_level: str = "INFO"
 
 

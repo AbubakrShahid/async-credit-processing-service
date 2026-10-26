@@ -8,10 +8,13 @@ import pytest
 from celery.contrib.testing.worker import start_worker
 from fastapi.testclient import TestClient
 from pymongo.database import Database
+from pymongo.errors import AutoReconnect
 
+from credit_service import worker as worker_module
 from credit_service.api.app import app
 from credit_service.celery_app import enqueue_credit
 from credit_service.db import Document
+from credit_service.repository import CreditRepository
 from credit_service.services import CreditService
 from credit_service.worker import celery_app
 
@@ -75,3 +78,37 @@ def test_message_redelivered_after_commit_is_a_no_op(
     user = db.users.find_one({"user_id": "u_123"})
     assert user is not None
     assert user["balance"] == Decimal("151.00")
+
+
+def test_transient_mongo_error_is_retried(
+    worker: None,
+    service: CreditService,
+    db: Database[Document],
+    make_user: Callable[..., str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_user("u_123")
+    operation = service.submit_credit("u_123", Decimal("20.00"))
+
+    real_apply = CreditRepository.apply_credit
+    calls = 0
+
+    def flaky_apply(self: CreditRepository, task_id: str) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise AutoReconnect("primary stepped down")
+        return real_apply(self, task_id)
+
+    monkeypatch.setattr(CreditRepository, "apply_credit", flaky_apply)
+    monkeypatch.setattr(worker_module, "retry_delay", lambda *_: 0)
+    enqueue_credit(operation.task_id)
+
+    def processed() -> bool:
+        doc = db.credit_operations.find_one({"_id": operation.task_id})
+        return doc is not None and doc["status"] == "processed"
+
+    wait_for(processed)
+    doc = db.credit_operations.find_one({"_id": operation.task_id})
+    assert doc is not None
+    assert doc["attempts"] == 2

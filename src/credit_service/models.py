@@ -15,6 +15,7 @@ class CreditStatus(StrEnum):
 
 class ApplyOutcome(StrEnum):
     APPLIED = "applied"
+    FAILED = "failed"
     ALREADY_SETTLED = "already_settled"
     NOT_FOUND = "not_found"
 
