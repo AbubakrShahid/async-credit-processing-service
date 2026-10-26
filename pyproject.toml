@@ -14,7 +14,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
+    "celery-types>=0.26.0",
+    "httpx2>=2.16.0",
     "mypy>=2.4.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.1",
