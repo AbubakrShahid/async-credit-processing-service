@@ -3,7 +3,7 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from pymongo import MongoClient, ReturnDocument
+from pymongo import ASCENDING, MongoClient, ReturnDocument
 from pymongo.client_session import ClientSession
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
@@ -71,6 +71,7 @@ class CreditRepository:
             "created_at": now,
             "updated_at": now,
             "processed_at": None,
+            "last_enqueued_at": now,
         }
         if idempotency_key is not None:
             doc |= {"idempotency_key": idempotency_key, "request_fingerprint": fingerprint}
@@ -180,6 +181,26 @@ class CreditRepository:
 
         with self._client.start_session() as session:
             return session.with_transaction(txn)
+
+    def claim_stale_operations(self, enqueued_before: datetime, limit: int) -> list[str]:
+        """Claim pending credits not (re)published since `enqueued_before`.
+
+        Each claim bumps last_enqueued_at atomically, so concurrent sweeps never claim
+        the same credit twice.
+        """
+        now = datetime.now(UTC)
+        claimed: list[str] = []
+        while len(claimed) < limit:
+            doc = self._operations.find_one_and_update(
+                {"status": CreditStatus.PROCESSING, "last_enqueued_at": {"$lt": enqueued_before}},
+                {"$set": {"last_enqueued_at": now}},
+                sort=[("last_enqueued_at", ASCENDING)],
+                projection={"_id": True},
+            )
+            if doc is None:
+                break
+            claimed.append(doc["_id"])
+        return claimed
 
     def get_operation(self, task_id: str) -> CreditOperation | None:
         doc = self._operations.find_one({"_id": task_id})

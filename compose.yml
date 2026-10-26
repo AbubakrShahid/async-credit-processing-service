@@ -6,6 +6,7 @@ x-app: &app
     MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
     BROKER_URL: amqp://guest:guest@rabbitmq:5672//
     LOG_LEVEL: INFO
+    STALE_AFTER_SECONDS: ${STALE_AFTER_SECONDS:-120}
   depends_on:
     mongo:
       condition: service_healthy
@@ -22,6 +23,11 @@ services:
   worker:
     <<: *app
     command: ["celery", "-A", "credit_service.worker", "worker", "--loglevel=INFO", "--concurrency=4"]
+
+  # Exactly one beat instance: it schedules the stale-credit sweeper.
+  beat:
+    <<: *app
+    command: ["celery", "-A", "credit_service.worker", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
 
   mongo:
     # 8.0.x refuses to start on Linux kernel >= 6.19 (SERVER-121912); 8.2 runs fine.

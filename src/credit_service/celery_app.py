@@ -3,6 +3,7 @@ from celery import Celery
 from credit_service.config import Settings, get_settings
 
 APPLY_CREDIT_TASK = "credit_service.apply_credit"
+REQUEUE_STALE_TASK = "credit_service.requeue_stale_credits"
 
 
 def create_celery(settings: Settings) -> Celery:
@@ -27,6 +28,14 @@ def create_celery(settings: Settings) -> Celery:
             "interval_start": 0,
             "interval_step": 0.5,
             "interval_max": 1,
+        },
+        beat_schedule={
+            "requeue-stale-credits": {
+                "task": REQUEUE_STALE_TASK,
+                "schedule": settings.sweep_interval_seconds,
+                # Don't let sweeps pile up while no worker is consuming.
+                "options": {"expires": settings.sweep_interval_seconds},
+            }
         },
     )
     return app

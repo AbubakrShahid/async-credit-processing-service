@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     # Hard cap across retries, redeliveries and requeues before a credit is marked failed.
     max_attempts: int = 10
 
+    # Sweeper: republish credits stuck in `processing` (publish failed, message lost).
+    # stale_after must comfortably exceed queue latency plus the retry backoff window.
+    sweep_interval_seconds: float = 30.0
+    stale_after_seconds: float = 120.0
+    sweep_batch_size: int = 100
+
     log_level: str = "INFO"
 
 

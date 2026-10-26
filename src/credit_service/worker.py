@@ -2,11 +2,17 @@
 
 import logging
 import random
+from datetime import timedelta
 from functools import cache
 
 from celery import Task
 
-from credit_service.celery_app import APPLY_CREDIT_TASK, celery_app, enqueue_credit
+from credit_service.celery_app import (
+    APPLY_CREDIT_TASK,
+    REQUEUE_STALE_TASK,
+    celery_app,
+    enqueue_credit,
+)
 from credit_service.config import get_settings
 from credit_service.db import create_client, get_database, is_transient
 from credit_service.repository import CreditRepository
@@ -55,3 +61,15 @@ def apply_credit(self: "Task[[str], str]", task_id: str) -> str:
         raise self.retry(exc=exc, countdown=countdown) from exc
     logger.info("Credit %s: %s", task_id, outcome)
     return outcome.value
+
+
+@celery_app.task(name=REQUEUE_STALE_TASK)
+def requeue_stale_credits() -> int:
+    """Periodic (celery beat) safety net for credits whose message never got processed."""
+    settings = get_settings()
+    count = get_service().requeue_stale_credits(
+        timedelta(seconds=settings.stale_after_seconds), settings.sweep_batch_size
+    )
+    if count:
+        logger.warning("Requeued %d stale credits", count)
+    return count

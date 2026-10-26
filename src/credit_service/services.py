@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from credit_service.errors import CreditNotFoundError, UserNotFoundError
@@ -31,7 +32,7 @@ class CreditService:
             self._enqueue(operation.task_id)
         except Exception:
             # The operation is already durable in MongoDB, so the request is accepted
-            # either way; it stays in `processing` until it is published again.
+            # either way; the sweeper republishes it once it counts as stale.
             logger.exception("Failed to publish credit %s", operation.task_id)
         return operation
 
@@ -50,6 +51,22 @@ class CreditService:
         if outcome is ApplyOutcome.NOT_FOUND:
             logger.warning("Credit %s does not exist; dropping task", task_id)
         return outcome
+
+    def requeue_stale_credits(self, stale_after: timedelta, limit: int) -> int:
+        """Republish credits stuck in `processing`. Returns how many were published.
+
+        A requeued credit may still have its original message in the queue; that is
+        harmless because applying a credit is idempotent.
+        """
+        task_ids = self._repository.claim_stale_operations(datetime.now(UTC) - stale_after, limit)
+        for published, task_id in enumerate(task_ids):
+            try:
+                self._enqueue(task_id)
+            except Exception:
+                # Claimed but unpublished credits become stale again and are retried.
+                logger.exception("Requeue failed with %d credits left", len(task_ids) - published)
+                return published
+        return len(task_ids)
 
     def _fail(self, task_id: str, reason: str) -> ApplyOutcome:
         logger.error("Credit %s failed: %s", task_id, reason)

@@ -65,3 +65,4 @@ def ensure_indexes(db: Database[Document]) -> None:
         unique=True,
         partialFilterExpression={"idempotency_key": {"$type": "string"}},
     )
+    db.credit_operations.create_index([("status", ASCENDING), ("last_enqueued_at", ASCENDING)])

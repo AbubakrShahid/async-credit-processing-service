@@ -2,6 +2,7 @@
 
 import time
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -112,3 +113,32 @@ def test_transient_mongo_error_is_retried(
     doc = db.credit_operations.find_one({"_id": operation.task_id})
     assert doc is not None
     assert doc["attempts"] == 2
+
+
+def test_credit_lost_at_publish_is_recovered_by_sweeper(
+    worker: None,
+    repository: CreditRepository,
+    db: Database[Document],
+    make_user: Callable[..., str],
+) -> None:
+    make_user("u_123", balance=Decimal("100.00"))
+
+    def broker_down(_: str) -> None:
+        raise ConnectionError("broker down")
+
+    operation = CreditService(repository, broker_down).submit_credit("u_123", Decimal("5.00"))
+    db.credit_operations.update_one(
+        {"_id": operation.task_id},
+        {"$set": {"last_enqueued_at": datetime.now(UTC) - timedelta(hours=1)}},
+    )
+
+    assert worker_module.requeue_stale_credits() == 1
+
+    def processed() -> bool:
+        doc = db.credit_operations.find_one({"_id": operation.task_id})
+        return doc is not None and doc["status"] == "processed"
+
+    wait_for(processed)
+    user = db.users.find_one({"user_id": "u_123"})
+    assert user is not None
+    assert user["balance"] == Decimal("105.00")
