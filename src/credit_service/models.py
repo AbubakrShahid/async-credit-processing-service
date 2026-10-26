@@ -13,6 +13,12 @@ class CreditStatus(StrEnum):
     FAILED = "failed"
 
 
+class ApplyOutcome(StrEnum):
+    APPLIED = "applied"
+    ALREADY_SETTLED = "already_settled"
+    NOT_FOUND = "not_found"
+
+
 @dataclass(frozen=True, slots=True)
 class CreditOperation:
     task_id: str

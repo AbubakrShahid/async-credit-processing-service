@@ -2,7 +2,7 @@ import logging
 from collections.abc import Callable
 from decimal import Decimal
 
-from credit_service.models import CreditOperation
+from credit_service.models import ApplyOutcome, CreditOperation
 from credit_service.repository import CreditRepository
 
 logger = logging.getLogger(__name__)
@@ -26,3 +26,9 @@ class CreditService:
             # either way; it stays in `processing` until it is published again.
             logger.exception("Failed to publish credit %s", operation.task_id)
         return operation
+
+    def apply_credit(self, task_id: str) -> ApplyOutcome:
+        outcome = self._repository.apply_credit(task_id)
+        if outcome is ApplyOutcome.NOT_FOUND:
+            logger.warning("Credit %s does not exist; dropping task", task_id)
+        return outcome

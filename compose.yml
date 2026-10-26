@@ -19,6 +19,10 @@ services:
     ports:
       - "8000:8000"
 
+  worker:
+    <<: *app
+    command: ["celery", "-A", "credit_service.worker", "worker", "--loglevel=INFO", "--concurrency=4"]
+
   mongo:
     # 8.0.x refuses to start on Linux kernel >= 6.19 (SERVER-121912); 8.2 runs fine.
     image: mongo:8.2

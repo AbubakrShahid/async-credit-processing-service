@@ -3,13 +3,17 @@ from celery import Celery
 from credit_service.config import Settings, get_settings
 
 APPLY_CREDIT_TASK = "credit_service.apply_credit"
-CREDITS_QUEUE = "credits"
 
 
 def create_celery(settings: Settings) -> Celery:
     app = Celery("credit_service", broker=settings.broker_url)
     app.conf.update(
-        task_default_queue=CREDITS_QUEUE,
+        task_default_queue=settings.credits_queue,
+        # At-least-once: ack only after the task finished, and requeue if the worker
+        # process dies mid-task. Safe because applying a credit is idempotent.
+        task_acks_late=True,
+        task_reject_on_worker_lost=True,
+        worker_prefetch_multiplier=1,
         task_serializer="json",
         accept_content=["json"],
         # Status lives in MongoDB, not in a Celery result backend.

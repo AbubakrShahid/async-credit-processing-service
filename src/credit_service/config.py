@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     mongo_timeout_ms: int = 5000
 
     broker_url: str = "amqp://guest:guest@localhost:5672//"
+    credits_queue: str = "credits"
 
     log_level: str = "INFO"
 
