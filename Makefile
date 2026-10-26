@@ -1,4 +1,4 @@
-.PHONY: up down logs ps seed smoke check lint fmt typecheck test test-unit test-integration
+.PHONY: up down logs ps seed smoke check lint fmt typecheck alerts-check test test-unit test-integration
 
 up:
 	docker compose up -d --build --wait
@@ -30,6 +30,10 @@ fmt:
 
 typecheck:
 	uv run mypy
+
+alerts-check:
+	docker run --rm -v "$(CURDIR)/ops:/ops:ro" -w /ops --entrypoint promtool prom/prometheus:v3.5.0 check rules prometheus-alerts.yml
+	docker run --rm -v "$(CURDIR)/ops:/ops:ro" -w /ops --entrypoint promtool prom/prometheus:v3.5.0 test rules prometheus-alerts.test.yml
 
 test:
 	uv run pytest

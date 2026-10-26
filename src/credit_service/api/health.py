@@ -1,5 +1,6 @@
 from typing import Any
 
+import pymongo
 from fastapi import APIRouter, Request, Response, status
 from pymongo import MongoClient
 
@@ -26,7 +27,9 @@ def ready(request: Request, response: Response) -> dict[str, Any]:
 
 def _check_mongo(client: MongoClient[Any]) -> str:
     try:
-        client.admin.command("ping")
+        # Probes must answer quickly; an unreachable database is "not ready", not a hang.
+        with pymongo.timeout(2):
+            client.admin.command("ping")
     except Exception as exc:
         return f"error: {type(exc).__name__}"
     return "ok"

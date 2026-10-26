@@ -1,5 +1,6 @@
 """Authentication, admission control and safe retries at the API boundary."""
 
+import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -140,3 +141,30 @@ def test_metrics_expose_backlog(
     assert "credit_backlog_up 1.0" in body
     assert "credit_processing 1.0" in body
     assert "credit_oldest_processing_age_seconds" in body
+
+
+def test_request_fails_fast_when_transactions_keep_failing(
+    api: TestClient,
+    service: CreditService,
+    db: Database[Document],
+    make_user: Callable[..., str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The driver retries transient transaction errors for up to 120s; the request's
+    # MongoDB deadline must cut that short and answer 503.
+    make_user("u_123")
+    app.state.db_deadline_seconds = 1.0
+
+    def write_conflict(*_: Any, **__: Any) -> None:
+        raise OperationFailure(
+            "WriteConflict", code=112, details={"errorLabels": ["TransientTransactionError"]}
+        )
+
+    operations = service._repository._operations
+    monkeypatch.setattr(operations, "insert_one", write_conflict)
+    started = time.monotonic()
+    response = api.post("/credits", json=CREDIT)
+
+    assert response.status_code == 503
+    assert time.monotonic() - started < 5
+    assert db.credit_operations.count_documents({}) == 0

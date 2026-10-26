@@ -29,6 +29,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.mongo_client = client
     app.state.credit_service = service
     app.state.api_key_clients = settings.api_key_clients()
+    app.state.db_deadline_seconds = settings.api_db_deadline_seconds
     app.state.metrics_registry.register(collector)
     yield
     app.state.metrics_registry.unregister(collector)

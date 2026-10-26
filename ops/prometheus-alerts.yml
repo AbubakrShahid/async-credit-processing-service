@@ -1,0 +1,71 @@
+# Alerts for the credit service. The credit_* gauges are read from MongoDB at scrape time
+# (GET /metrics on any API instance), so they reflect every API and worker process.
+groups:
+  - name: credit-service
+    rules:
+      - alert: CreditParked
+        expr: credit_parked > 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} credit(s) parked after repeated crashes"
+          description: >-
+            These credits are still owed to users but will not be retried automatically.
+            List them with db.credit_operations.find({parked_at: {$ne: null}}); the `error`
+            field and worker logs (event credit_parked) say why. Once the cause is fixed,
+            release them with `python -m credit_service.unpark <task_id> ...`.
+
+      - alert: CreditsFailed
+        expr: delta(credit_failed[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Credits failed permanently in the last 15 minutes"
+          description: >-
+            Failed credits did not change any balance. Each has an `error` (e.g. the user was
+            deleted after the credit was accepted); confirm with the client before re-submitting.
+
+      - alert: CreditSettlementStalled
+        expr: credit_oldest_processing_age_seconds > 600
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "A credit has been processing for over 10 minutes"
+          description: >-
+            Workers are down or stuck, MongoDB/RabbitMQ is unavailable, or a credit is parked
+            (see CreditParked). Check worker health, then the dispatch_run log events.
+
+      - alert: CreditsNotPublished
+        expr: credit_oldest_unpublished_age_seconds > 120
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Accepted credits have not reached the broker for over 2 minutes"
+          description: >-
+            RabbitMQ is unreachable or the dispatcher is not running (check the beat
+            container). Credits are safe in MongoDB and publish once both are healthy.
+
+      - alert: CreditQueueBacklog
+        expr: credit_queue_depth > 50000
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Credit queue backlog above 50k for 10 minutes"
+          description: >-
+            Workers are not keeping up; scale them out. At 100k (MAX_QUEUE_DEPTH) the API
+            starts answering 503 to new credits.
+
+      - alert: CreditMetricsUnavailable
+        expr: credit_backlog_up == 0 or absent(credit_backlog_up)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Credit backlog metrics cannot be read"
+          description: >-
+            The API cannot read MongoDB (or is not being scraped), so every other credit alert
+            is blind. Check /health/ready.

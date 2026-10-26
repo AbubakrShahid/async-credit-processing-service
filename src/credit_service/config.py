@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     # can leave a call waiting on a dead socket indefinitely. (Transactions are additionally
     # retried in place by with_transaction for up to 120s before an error surfaces.)
     mongo_operation_timeout_ms: int = 10_000
+    # Total MongoDB time one API request may use, transaction retries included, so a
+    # database outage turns into a prompt 503 instead of a request held for ~2 minutes.
+    api_db_deadline_seconds: float = 10.0
 
     broker_url: str = "amqp://guest:guest@localhost:5672//"
     credits_queue: str = "credits"

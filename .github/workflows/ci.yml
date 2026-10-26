@@ -23,6 +23,9 @@ jobs:
       - name: Lint and type-check
         run: make lint typecheck
 
+      - name: Validate and unit-test alert rules
+        run: make alerts-check
+
       - name: Start MongoDB and RabbitMQ
         run: docker compose up -d --wait mongo rabbitmq
 

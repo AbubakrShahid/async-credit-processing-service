@@ -22,7 +22,7 @@ flowchart LR
 | Component | Role and key settings |
 |---|---|
 | **API** (FastAPI) | Checks admission limits, records the credit, publishes and returns `202`. Handlers are synchronous because PyMongo and Celery publishing block; FastAPI runs them in its threadpool, so the event loop is never blocked. |
-| **MongoDB** 8.2 | The source of truth, as a replica set (transactions need one). Majority-journaled writes and snapshot reads are pinned in code; every operation has a 10s timeout. |
+| **MongoDB** 8.2 | The source of truth, as a replica set (transactions need one). Majority-journaled writes and snapshot reads are pinned in code. Each operation times out after 10s, and an API request's total MongoDB time is capped at 10s. |
 | **RabbitMQ** | A durable queue with persistent messages and publisher confirms. Its ack and redelivery behaviour is explicit, which is why I chose it over Redis. |
 | **Worker** (Celery) | `acks_late`, `reject_on_worker_lost`, `prefetch=1`, and a hard time limit: a message is only removed after the credit has committed. |
 | **Beat** | Triggers the dispatcher every 15s; concurrent runs are safe. |
@@ -56,7 +56,7 @@ A single `status` on the user can't describe two credits in flight at once. So t
 
 ## 6. Testing and verification
 
-The 88 tests run against **real MongoDB and RabbitMQ**, because transactions, write conflicts and redelivery are exactly what's being tested, and mocks would only repeat my own assumptions. Each failure in §5 is reproduced at the boundary where it happens: a real consumer commits and drops its connection without acking; a commit succeeds and then reports `UnknownTransactionCommitResult`; a dispatcher dies between publishing and recording; the queue depth is forced to show a backlog. CI runs ruff, `mypy --strict`, the tests, an image build and a smoke test.
+The 89 tests run against **real MongoDB and RabbitMQ**, because transactions, write conflicts and redelivery are exactly what's being tested, and mocks would only repeat my own assumptions. Each failure in §5 is reproduced at the boundary where it happens: a real consumer commits and drops its connection without acking; a commit succeeds and then reports `UnknownTransactionCommitResult`; a dispatcher dies between publishing and recording; the queue depth is forced to show a backlog. CI runs ruff, `mypy --strict`, the tests, an image build and a smoke test.
 
 Concurrency tests read snapshot transactions *while processing runs* to check that the balance always equals the opening balance plus processed credits, and that `pending_credits` always equals the number of credits in flight. Each key guard was broken on purpose and its tests failed. Drills on the Docker stack:
 
@@ -70,4 +70,4 @@ Concurrency tests read snapshot transactions *while processing runs* to check th
 - **A very busy single account is a bottleneck.** Every credit writes the same user document (about 100–150/s per account on a laptop), and `429` keeps its backlog bounded. A ledger with a computed balance would remove this limit, but it changes the `balance` contract the brief asks for, so I documented it rather than building it.
 - **Throughput:** about 315 requests/s on a laptop (1 API process, 4 workers). That isn't a capacity claim: everything scales horizontally, and production needs its own benchmark.
 - **Deployment:** a 3-node replica set with majority writes, RabbitMQ quorum queues, several API and worker instances, and secrets and TLS for the real credentials.
-- **Operations:** `/metrics` gauges are read from MongoDB, so they cover every process: in flight, unpublished, parked and failed credits, the oldest ages and queue depth. Alert on the ages and on parked or failed credits. Credit records are the audit trail: archive them, never expire them with a TTL, and reconcile balances against them.
+- **Operations:** `/metrics` gauges are read from MongoDB, so they cover every process. `ops/prometheus-alerts.yml` turns them into tested alerts, each saying what to do; a parked credit pages someone. Credit records are the audit trail: archive them, never expire them with a TTL, and reconcile balances against them.

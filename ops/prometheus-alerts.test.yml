@@ -1,0 +1,71 @@
+# promtool test rules ops/prometheus-alerts.test.yml
+rule_files:
+  - prometheus-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: credit_parked
+        values: "0 0 1 1 1 0"
+      - series: credit_backlog_up
+        values: "1x6"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CreditParked
+        exp_alerts: []  # pending: must persist for 1m first
+      - eval_time: 3m
+        alertname: CreditParked
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "1 credit(s) parked after repeated crashes"
+              description: "These credits are still owed to users but will not be retried automatically. List them with db.credit_operations.find({parked_at: {$ne: null}}); the `error` field and worker logs (event credit_parked) say why. Once the cause is fixed, release them with `python -m credit_service.unpark <task_id> ...`."
+      - eval_time: 5m
+        alertname: CreditParked
+        exp_alerts: []  # released
+
+  - interval: 1m
+    input_series:
+      - series: credit_failed
+        values: "0 0 2 2"
+      - series: credit_oldest_processing_age_seconds
+        values: "0+120x12"
+      - series: credit_backlog_up
+        values: "1x12"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CreditsFailed
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: "Credits failed permanently in the last 15 minutes"
+              description: "Failed credits did not change any balance. Each has an `error` (e.g. the user was deleted after the credit was accepted); confirm with the client before re-submitting."
+      - eval_time: 9m
+        alertname: CreditSettlementStalled
+        exp_alerts: []  # over 600s since 6m, but not yet for 5m
+      - eval_time: 11m
+        alertname: CreditSettlementStalled
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "A credit has been processing for over 10 minutes"
+              description: "Workers are down or stuck, MongoDB/RabbitMQ is unavailable, or a credit is parked (see CreditParked). Check worker health, then the dispatch_run log events."
+
+  - interval: 1m
+    input_series:
+      - series: credit_backlog_up
+        values: "0x6"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CreditMetricsUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "Credit backlog metrics cannot be read"
+              description: "The API cannot read MongoDB (or is not being scraped), so every other credit alert is blind. Check /health/ready."
