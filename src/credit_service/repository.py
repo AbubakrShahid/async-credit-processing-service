@@ -10,7 +10,7 @@ from pymongo.errors import DuplicateKeyError
 
 from credit_service.db import Document
 from credit_service.errors import IdempotencyConflictError, UserNotFoundError
-from credit_service.models import ApplyOutcome, CreditOperation, CreditStatus
+from credit_service.models import ApplyOutcome, CreditOperation, CreditStatus, User
 
 
 def new_task_id() -> str:
@@ -151,3 +151,7 @@ class CreditRepository:
     def get_operation(self, task_id: str) -> CreditOperation | None:
         doc = self._operations.find_one({"_id": task_id})
         return CreditOperation.from_document(doc) if doc else None
+
+    def get_user(self, user_id: str) -> User | None:
+        doc = self._users.find_one({"user_id": user_id})
+        return User.from_document(doc) if doc else None

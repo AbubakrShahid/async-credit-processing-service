@@ -2,7 +2,8 @@ import logging
 from collections.abc import Callable
 from decimal import Decimal
 
-from credit_service.models import ApplyOutcome, CreditOperation
+from credit_service.errors import CreditNotFoundError, UserNotFoundError
+from credit_service.models import ApplyOutcome, CreditOperation, User
 from credit_service.repository import CreditRepository
 
 logger = logging.getLogger(__name__)
@@ -36,3 +37,15 @@ class CreditService:
         if outcome is ApplyOutcome.NOT_FOUND:
             logger.warning("Credit %s does not exist; dropping task", task_id)
         return outcome
+
+    def get_credit(self, task_id: str) -> CreditOperation:
+        operation = self._repository.get_operation(task_id)
+        if operation is None:
+            raise CreditNotFoundError(task_id)
+        return operation
+
+    def get_user(self, user_id: str) -> User:
+        user = self._repository.get_user(user_id)
+        if user is None:
+            raise UserNotFoundError(user_id)
+        return user

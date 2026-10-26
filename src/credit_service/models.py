@@ -44,3 +44,21 @@ class CreditOperation:
             updated_at=doc["updated_at"],
             processed_at=doc.get("processed_at"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class User:
+    user_id: str
+    balance: Decimal
+    status: CreditStatus | None
+    pending_credits: int
+
+    @classmethod
+    def from_document(cls, doc: Document) -> Self:
+        status = doc.get("status")
+        return cls(
+            user_id=doc["user_id"],
+            balance=doc.get("balance", Decimal("0.00")),
+            status=CreditStatus(status) if status else None,
+            pending_credits=doc.get("pending_credits", 0),
+        )

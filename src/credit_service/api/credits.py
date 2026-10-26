@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Response, status
 
 from credit_service.api.dependencies import CreditServiceDep
-from credit_service.api.schemas import CreditAccepted, CreditRequest
+from credit_service.api.schemas import CreditAccepted, CreditDetails, CreditRequest
 
 router = APIRouter(prefix="/credits", tags=["credits"])
 
@@ -39,3 +39,9 @@ def submit_credit(
     status_url = f"/credits/{operation.task_id}"
     response.headers["Location"] = status_url
     return CreditAccepted(task_id=operation.task_id, status=operation.status, status_url=status_url)
+
+
+@router.get("/{task_id}", responses={status.HTTP_404_NOT_FOUND: {"description": "Unknown task id"}})
+def get_credit(task_id: str, service: CreditServiceDep) -> CreditDetails:
+    """Status of a credit; `processed` means the balance has been updated."""
+    return CreditDetails.from_operation(service.get_credit(task_id))

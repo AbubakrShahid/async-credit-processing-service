@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from credit_service.api import credits
+from credit_service.api import credits, users
 from credit_service.api.errors import register_error_handlers
 from credit_service.celery_app import enqueue_credit
 from credit_service.config import get_settings
@@ -31,6 +31,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(credits.router)
+    app.include_router(users.router)
     register_error_handlers(app)
     return app
 
