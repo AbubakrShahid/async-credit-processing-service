@@ -13,21 +13,42 @@ class Settings(BaseSettings):
     broker_url: str = "amqp://guest:guest@localhost:5672//"
     credits_queue: str = "credits"
 
-    # Celery retries for transient MongoDB errors, with exponential backoff + full jitter.
+    # API keys as "client:key,client2:key2". Empty disables authentication (local dev only).
+    api_keys: str = ""
+
+    # Admission control, checked before a credit is accepted.
+    max_pending_per_user: int = 1_000  # 429 beyond this many in-flight credits per user
+    max_queue_depth: int = 100_000  # 503 while the broker backlog is this deep
+    # After a failed publish the API stops trying for this long and leaves new credits to
+    # the dispatcher, so a broker outage doesn't make every request wait on retries.
+    publish_pause_seconds: float = 5.0
+
+    # Worker: transient MongoDB errors are retried with exponential backoff + full jitter
+    # and never fail a credit. Business errors fail it at once; executions that die or hit
+    # an unexpected error (poison messages) fail it after `max_crashes`.
     task_max_retries: int = 5
     retry_backoff_seconds: float = 1.0
     retry_backoff_max_seconds: float = 60.0
-    # Hard cap across retries, redeliveries and requeues before a credit is marked failed.
-    max_attempts: int = 10
+    max_crashes: int = 3
+    task_time_limit_seconds: int = 300
 
-    # Sweeper: republish credits stuck in `processing` (publish failed, message lost).
-    # stale_after must comfortably exceed queue latency plus the retry backoff window.
-    sweep_interval_seconds: float = 30.0
-    stale_after_seconds: float = 120.0
-    sweep_batch_size: int = 100
+    # Dispatcher: publishes credits whose publish never got confirmed, and, only while the
+    # queue is drained, republishes confirmed credits that look lost.
+    dispatch_interval_seconds: float = 15.0
+    dispatch_time_budget_seconds: float = 10.0
+    dispatch_batch_size: int = 500
+    dispatch_lease_seconds: float = 60.0
+    publish_grace_seconds: float = 10.0
+    republish_after_seconds: float = 900.0
+    reconcile_max_queue_depth: int = 100
 
     log_level: str = "INFO"
     log_format: str = "json"  # or "console" for local development
+
+    def api_key_clients(self) -> dict[str, str]:
+        """Map each API key to the client it belongs to."""
+        pairs = (entry.split(":", 1) for entry in self.api_keys.split(",") if entry.strip())
+        return {key.strip(): client.strip() for client, key in pairs}
 
 
 @lru_cache

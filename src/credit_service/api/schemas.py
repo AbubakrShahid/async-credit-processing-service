@@ -47,6 +47,7 @@ class CreditDetails(BaseModel):
     error: str | None
     created_at: datetime
     processed_at: datetime | None
+    published_at: datetime | None
 
     @classmethod
     def from_operation(cls, operation: CreditOperation) -> "CreditDetails":
@@ -59,6 +60,7 @@ class CreditDetails(BaseModel):
             error=operation.error,
             created_at=operation.created_at,
             processed_at=operation.processed_at,
+            published_at=operation.published_at,
         )
 
 

@@ -1,9 +1,9 @@
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 
-from credit_service.api.dependencies import CreditServiceDep
+from credit_service.api.dependencies import CreditServiceDep, authenticate
 from credit_service.api.schemas import UserBalance
 
-router = APIRouter(prefix="/users", tags=["users"])
+router = APIRouter(prefix="/users", tags=["users"], dependencies=[Depends(authenticate)])
 
 
 @router.get(

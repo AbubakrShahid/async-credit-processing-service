@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import random
 import time
-from datetime import timedelta
 from functools import cache
 
 import structlog
@@ -14,7 +13,8 @@ from celery.signals import setup_logging, task_prerun
 
 from credit_service.celery_app import (
     APPLY_CREDIT_TASK,
-    REQUEUE_STALE_TASK,
+    DISPATCH_TASK,
+    QueueDepthProbe,
     celery_app,
     enqueue_credit,
 )
@@ -50,8 +50,9 @@ def get_service() -> CreditService:
     # must not be created in the parent before the prefork pool starts.
     settings = get_settings()
     client = create_client(settings)
-    repository = CreditRepository(client, get_database(client, settings))
-    return CreditService(repository, enqueue_credit, max_attempts=settings.max_attempts)
+    repository = CreditRepository(client, get_database(client, settings), settings)
+    queue_depth = QueueDepthProbe(celery_app, settings.credits_queue, ttl_seconds=0)
+    return CreditService(repository, enqueue_credit, settings, queue_depth)
 
 
 def retry_delay(retries: int, base: float, cap: float) -> float:
@@ -63,15 +64,21 @@ def retry_delay(retries: int, base: float, cap: float) -> float:
 def apply_credit(self: Task[[str], str], task_id: str) -> str:
     """Apply one credit.
 
-    Transient MongoDB errors are retried with backoff. If retries run out, the task fails
-    but the credit stays `processing`, so it is picked up again later; the attempts cap
-    in CreditService is what finally marks a credit as failed.
+    Transient MongoDB errors are retried with backoff. If retries run out the task fails,
+    but the credit stays `processing` and the dispatcher republishes it later: an outage
+    delays a credit, it never fails it. Unexpected errors count towards the crash budget.
     """
+    # RabbitMQ flags a message it delivers again after its consumer died without acking.
+    redelivered = bool((self.request.delivery_info or {}).get("redelivered"))
     started = time.perf_counter()
+    service = get_service()
     try:
-        outcome = get_service().apply_credit(task_id)
+        outcome = service.apply_credit(task_id, redelivered=redelivered)
     except Exception as exc:
-        if not is_transient(exc):
+        transient = is_transient(exc)
+        service.record_failed_attempt(task_id, exc, transient=transient)
+        if not transient:
+            logger.exception("credit_processing_error")
             raise
         settings = get_settings()
         countdown = retry_delay(
@@ -87,18 +94,27 @@ def apply_credit(self: Task[[str], str], task_id: str) -> str:
     logger.info(
         "credit_processed",
         outcome=outcome.value,
+        redelivered=redelivered,
         duration_ms=round((time.perf_counter() - started) * 1000, 1),
     )
     return outcome.value
 
 
-@celery_app.task(name=REQUEUE_STALE_TASK)
-def requeue_stale_credits() -> int:
-    """Periodic (celery beat) safety net for credits whose message never got processed."""
-    settings = get_settings()
-    count = get_service().requeue_stale_credits(
-        timedelta(seconds=settings.stale_after_seconds), settings.sweep_batch_size
+@celery_app.task(name=DISPATCH_TASK)
+def dispatch_pending_credits() -> int:
+    """Periodic (celery beat): publish credits the API couldn't, recover lost messages."""
+    service = get_service()
+    report = service.dispatch_pending()
+    stats = service.backlog_stats()
+    log = logger.warning if report.published or not report.broker_available else logger.info
+    log(
+        "dispatch_run",
+        published=report.published,
+        reconciled=report.reconciled,
+        broker_available=report.broker_available,
+        unpublished=stats.unpublished,
+        oldest_unpublished_age_s=round(stats.oldest_unpublished_age_seconds, 1),
+        processing=stats.processing,
+        oldest_processing_age_s=round(stats.oldest_processing_age_seconds, 1),
     )
-    if count:
-        logger.warning("stale_credits_requeued", count=count)
-    return count
+    return report.published

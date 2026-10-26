@@ -18,3 +18,14 @@ class CreditNotFoundError(CreditServiceError):
     def __init__(self, task_id: str) -> None:
         super().__init__(f"credit '{task_id}' not found")
         self.task_id = task_id
+
+
+class TooManyPendingCreditsError(CreditServiceError):
+    def __init__(self, user_id: str) -> None:
+        super().__init__(f"user '{user_id}' has too many credits in flight; retry later")
+        self.user_id = user_id
+
+
+class ServiceOverloadedError(CreditServiceError):
+    def __init__(self) -> None:
+        super().__init__("credit processing is backlogged; retry later")

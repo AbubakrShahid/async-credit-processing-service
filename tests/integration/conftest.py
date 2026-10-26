@@ -12,7 +12,7 @@ from credit_service.api.dependencies import get_credit_service
 from credit_service.config import Settings, get_settings
 from credit_service.db import Document, create_client, ensure_indexes, get_database
 from credit_service.repository import CreditRepository
-from credit_service.services import CreditService
+from credit_service.services import CreditService, Enqueue, QueueDepth
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -48,8 +48,10 @@ def db(mongo_client: MongoClient[Document], settings: Settings) -> Database[Docu
 
 
 @pytest.fixture
-def repository(mongo_client: MongoClient[Document], db: Database[Document]) -> CreditRepository:
-    return CreditRepository(mongo_client, db)
+def repository(
+    mongo_client: MongoClient[Document], db: Database[Document], settings: Settings
+) -> CreditRepository:
+    return CreditRepository(mongo_client, db, settings)
 
 
 @pytest.fixture
@@ -59,8 +61,26 @@ def published() -> list[str]:
 
 
 @pytest.fixture
-def service(repository: CreditRepository, published: list[str]) -> CreditService:
-    return CreditService(repository, published.append)
+def make_service(
+    mongo_client: MongoClient[Document], db: Database[Document], settings: Settings
+) -> Callable[..., CreditService]:
+    """Build a service with a custom publisher, queue depth probe or settings overrides."""
+
+    def _make_service(
+        enqueue: Enqueue = lambda _: None,
+        queue_depth: QueueDepth = lambda: None,
+        **overrides: Any,
+    ) -> CreditService:
+        custom = settings.model_copy(update=overrides)
+        repository = CreditRepository(mongo_client, db, custom)
+        return CreditService(repository, enqueue, custom, queue_depth)
+
+    return _make_service
+
+
+@pytest.fixture
+def service(make_service: Callable[..., CreditService], published: list[str]) -> CreditService:
+    return make_service(published.append)
 
 
 @pytest.fixture

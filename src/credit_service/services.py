@@ -1,82 +1,166 @@
+import time
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import structlog
+from pymongo.errors import PyMongoError
 
-from credit_service.errors import CreditNotFoundError, UserNotFoundError
-from credit_service.models import ApplyOutcome, CreditOperation, User
+from credit_service.config import Settings
+from credit_service.errors import CreditNotFoundError, ServiceOverloadedError, UserNotFoundError
+from credit_service.models import ApplyOutcome, BacklogStats, CreditOperation, DispatchReport, User
 from credit_service.repository import CreditRepository
 
 logger = structlog.get_logger(__name__)
 
 type Enqueue = Callable[[str], None]
+type QueueDepth = Callable[[], int | None]
+
+ANONYMOUS_CLIENT = "anonymous"
+
+
+def _unknown_depth() -> int | None:
+    return None
 
 
 class CreditService:
     """Credit workflows shared by the API and the worker. No FastAPI or Celery in here."""
 
     def __init__(
-        self, repository: CreditRepository, enqueue: Enqueue, max_attempts: int = 10
+        self,
+        repository: CreditRepository,
+        enqueue: Enqueue,
+        settings: Settings,
+        queue_depth: QueueDepth = _unknown_depth,
     ) -> None:
         self._repository = repository
         self._enqueue = enqueue
-        self._max_attempts = max_attempts
+        self._settings = settings
+        self._queue_depth = queue_depth
+        self._publish_paused_until = 0.0
+
+    # --- accepting -----------------------------------------------------------------------
 
     def submit_credit(
-        self, user_id: str, amount: Decimal, idempotency_key: str | None = None
+        self,
+        user_id: str,
+        amount: Decimal,
+        idempotency_key: str | None = None,
+        client_id: str = ANONYMOUS_CLIENT,
     ) -> CreditOperation:
-        operation, created = self._repository.create_operation(user_id, amount, idempotency_key)
-        log = logger.bind(task_id=operation.task_id, user_id=user_id)
+        # Admission control happens before anything is committed, so a rejected request
+        # leaves no trace and the client can simply retry later.
+        depth = self._queue_depth()
+        if depth is not None and depth >= self._settings.max_queue_depth:
+            raise ServiceOverloadedError()
+
+        operation, created = self._repository.create_operation(
+            user_id,
+            amount,
+            client_id=client_id,
+            idempotency_key=idempotency_key,
+            max_pending=self._settings.max_pending_per_user,
+        )
+        log = logger.bind(task_id=operation.task_id, user_id=user_id, client_id=client_id)
         if not created:
             log.info("credit_replayed", idempotency_key=idempotency_key)
+            return operation
+
+        # From here on the credit is committed: nothing below may fail the request, or a
+        # client without an idempotency key could retry and credit twice.
+        if time.monotonic() < self._publish_paused_until:
+            log.info("credit_publish_deferred")  # broker recently down; dispatcher publishes
             return operation
         try:
             self._enqueue(operation.task_id)
         except Exception:
-            # The operation is already durable in MongoDB, so the request is accepted
-            # either way; the sweeper republishes it once it counts as stale.
-            log.exception("credit_publish_failed")
-        else:
-            log.info("credit_accepted", amount=str(amount))
+            self._publish_paused_until = time.monotonic() + self._settings.publish_pause_seconds
+            log.exception("credit_publish_failed")  # the dispatcher publishes it later
+            return operation
+        try:
+            self._repository.mark_published([operation.task_id])
+        except PyMongoError:
+            # Published but not recorded: the dispatcher may publish it again, harmlessly.
+            log.warning("credit_publish_not_recorded", exc_info=True)
+        log.info("credit_accepted", amount=str(amount))
         return operation
 
-    def apply_credit(self, task_id: str) -> ApplyOutcome:
-        """Apply a credit. Transient MongoDB errors propagate so the caller can retry."""
-        attempts = self._repository.record_attempt(task_id)
-        if attempts is not None and attempts > self._max_attempts:
-            return self._fail(task_id, f"gave up after {self._max_attempts} attempts")
+    # --- processing ----------------------------------------------------------------------
+
+    def apply_credit(self, task_id: str, *, redelivered: bool = False) -> ApplyOutcome:
+        """Apply a credit. Transient MongoDB errors propagate so the caller can retry.
+
+        Failure policy: infrastructure errors never fail a credit (it is retried until
+        MongoDB is back); a business error fails it immediately; an execution that keeps
+        crashing the worker or raising unexpected errors fails it after `max_crashes`.
+        """
+        state = self._repository.start_attempt(task_id, redelivered=redelivered)
+        if state is None:
+            exists = self._repository.get_operation(task_id) is not None
+            if not exists:
+                logger.warning("credit_not_found", task_id=task_id)
+            return ApplyOutcome.ALREADY_SETTLED if exists else ApplyOutcome.NOT_FOUND
+        if state.crashes >= self._settings.max_crashes:
+            return self._fail(task_id, f"processing crashed {state.crashes} times; giving up")
 
         try:
-            outcome = self._repository.apply_credit(task_id)
+            return self._repository.apply_credit(task_id)
         except UserNotFoundError as exc:
             # The user was deleted after the credit was accepted; retrying won't help.
             return self._fail(task_id, str(exc))
 
-        if outcome is ApplyOutcome.NOT_FOUND:
-            logger.warning("credit_not_found", task_id=task_id)
-        return outcome
-
-    def requeue_stale_credits(self, stale_after: timedelta, limit: int) -> int:
-        """Republish credits stuck in `processing`. Returns how many were published.
-
-        A requeued credit may still have its original message in the queue; that is
-        harmless because applying a credit is idempotent.
-        """
-        task_ids = self._repository.claim_stale_operations(datetime.now(UTC) - stale_after, limit)
-        for published, task_id in enumerate(task_ids):
-            try:
-                self._enqueue(task_id)
-            except Exception:
-                # Claimed but unpublished credits become stale again and are retried.
-                logger.exception("credit_requeue_failed", remaining=len(task_ids) - published)
-                return published
-        return len(task_ids)
+    def record_failed_attempt(self, task_id: str, exc: BaseException, *, transient: bool) -> None:
+        """Best effort: MongoDB may be the thing that is failing."""
+        try:
+            self._repository.end_attempt(task_id, repr(exc), crashed=not transient)
+        except PyMongoError:
+            logger.warning("attempt_not_recorded", task_id=task_id, exc_info=True)
 
     def _fail(self, task_id: str, reason: str) -> ApplyOutcome:
         logger.error("credit_failed", task_id=task_id, reason=reason)
         self._repository.fail_credit(task_id, reason)
         return ApplyOutcome.FAILED
+
+    # --- dispatching ---------------------------------------------------------------------
+
+    def dispatch_pending(self) -> DispatchReport:
+        """Publish credits whose publish was never confirmed, in bounded batches.
+
+        Runs until nothing is due or the time budget is spent. Confirmed-but-unprocessed
+        credits are only republished while the queue is (nearly) drained: a deep queue
+        means they are most likely still waiting in it, and republishing would only make
+        the backlog worse.
+        """
+        settings = self._settings
+        depth = self._queue_depth()
+        reconcile = depth is not None and depth <= settings.reconcile_max_queue_depth
+        deadline = time.monotonic() + settings.dispatch_time_budget_seconds
+        published = 0
+
+        while time.monotonic() < deadline:
+            batch = self._repository.claim_for_dispatch(
+                settings.dispatch_batch_size, include_published=reconcile
+            )
+            if not batch:
+                break
+            for sent, task_id in enumerate(batch):
+                try:
+                    self._enqueue(task_id)
+                except Exception:
+                    # Broker unavailable: stop here and retry on the next scheduled run,
+                    # which caps the load on a struggling broker at one attempt per run.
+                    logger.exception("dispatch_publish_failed", remaining=len(batch) - sent)
+                    self._repository.mark_published(batch[:sent])
+                    self._repository.release_claims(batch[sent:])
+                    return DispatchReport(published + sent, reconcile, broker_available=False)
+            self._repository.mark_published(batch)
+            published += len(batch)
+
+        return DispatchReport(published, reconcile, broker_available=True)
+
+    def backlog_stats(self) -> BacklogStats:
+        return self._repository.backlog_stats()
+
+    # --- reads ---------------------------------------------------------------------------
 
     def get_credit(self, task_id: str) -> CreditOperation:
         operation = self._repository.get_operation(task_id)

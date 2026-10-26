@@ -31,6 +31,7 @@ class CreditOperation:
     created_at: datetime
     updated_at: datetime
     processed_at: datetime | None
+    published_at: datetime | None
 
     @classmethod
     def from_document(cls, doc: Document) -> Self:
@@ -44,7 +45,32 @@ class CreditOperation:
             created_at=doc["created_at"],
             updated_at=doc["updated_at"],
             processed_at=doc.get("processed_at"),
+            published_at=doc.get("published_at"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptState:
+    attempts: int
+    crashes: int
+
+
+@dataclass(frozen=True, slots=True)
+class BacklogStats:
+    """What an operator needs to see whether credits are flowing."""
+
+    processing: int
+    unpublished: int
+    failed: int
+    oldest_processing_age_seconds: float
+    oldest_unpublished_age_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchReport:
+    published: int
+    reconciled: bool  # whether confirmed-but-unprocessed credits were eligible this run
+    broker_available: bool
 
 
 @dataclass(frozen=True, slots=True)

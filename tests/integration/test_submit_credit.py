@@ -5,7 +5,6 @@ from fastapi.testclient import TestClient
 from pymongo.database import Database
 
 from credit_service.db import Document
-from credit_service.repository import CreditRepository
 from credit_service.services import CreditService
 
 
@@ -59,14 +58,49 @@ def test_invalid_amount_is_rejected(api: TestClient, make_user: Callable[..., st
         assert response.status_code == 422, amount
 
 
+def test_publish_is_recorded_once_confirmed(
+    service: CreditService, db: Database[Document], make_user: Callable[..., str]
+) -> None:
+    make_user("u_123")
+    operation = service.submit_credit("u_123", Decimal("5"))
+
+    stored = db.credit_operations.find_one({"_id": operation.task_id})
+    assert stored is not None
+    assert stored["published_at"] is not None
+
+
 def test_request_is_accepted_when_broker_publish_fails(
-    repository: CreditRepository, db: Database[Document], make_user: Callable[..., str]
+    make_service: Callable[..., CreditService],
+    db: Database[Document],
+    make_user: Callable[..., str],
 ) -> None:
     make_user("u_123")
 
     def broken_enqueue(_: str) -> None:
         raise ConnectionError("broker down")
 
-    operation = CreditService(repository, broken_enqueue).submit_credit("u_123", Decimal("5"))
+    operation = make_service(broken_enqueue).submit_credit("u_123", Decimal("5"))
 
-    assert db.credit_operations.find_one({"_id": operation.task_id}) is not None
+    stored = db.credit_operations.find_one({"_id": operation.task_id})
+    assert stored is not None
+    assert stored["published_at"] is None  # left for the dispatcher
+
+
+def test_publishing_pauses_after_a_broker_failure(
+    make_service: Callable[..., CreditService],
+    db: Database[Document],
+    make_user: Callable[..., str],
+) -> None:
+    make_user("u_123")
+    attempts: list[str] = []
+
+    def broker_down(task_id: str) -> None:
+        attempts.append(task_id)
+        raise ConnectionError("broker down")
+
+    service = make_service(broker_down, publish_pause_seconds=60)
+    for _ in range(5):
+        service.submit_credit("u_123", Decimal("1"))
+
+    assert len(attempts) == 1  # later requests don't wait on a broker known to be down
+    assert db.credit_operations.count_documents({"published_at": None}) == 5

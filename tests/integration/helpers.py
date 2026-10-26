@@ -8,9 +8,10 @@ from credit_service.worker import celery_app
 
 
 @contextmanager
-def running_worker(pool: str = "solo", concurrency: int = 1) -> Iterator[None]:
+def running_worker(pool: str = "solo", concurrency: int = 1, purge: bool = True) -> Iterator[None]:
     """A real Celery worker in this process, consuming the test queue from RabbitMQ."""
-    celery_app.control.purge()
+    if purge:
+        celery_app.control.purge()
     # The worker's event loop only checks for shutdown when a timer fires; a short AMQP
     # heartbeat makes it stop in well under a second instead of ~10s.
     celery_app.conf.broker_heartbeat = 1

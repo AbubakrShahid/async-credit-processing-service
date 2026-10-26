@@ -4,6 +4,7 @@ Standard library only, so it runs with any Python 3.
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -11,6 +12,7 @@ import uuid
 from decimal import Decimal
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
+API_KEY = os.environ.get("API_KEY", "local-dev-key")
 
 
 def call(method: str, path: str, body: dict[str, str] | None = None) -> tuple[int, dict]:
@@ -18,7 +20,11 @@ def call(method: str, path: str, body: dict[str, str] | None = None) -> tuple[in
         BASE_URL + path,
         method=method,
         data=json.dumps(body).encode() if body else None,
-        headers={"Content-Type": "application/json", "Idempotency-Key": str(uuid.uuid4())},
+        headers={
+            "Content-Type": "application/json",
+            "Idempotency-Key": str(uuid.uuid4()),
+            "X-API-Key": API_KEY,
+        },
     )
     with urllib.request.urlopen(request, timeout=5) as response:
         return response.status, json.load(response)

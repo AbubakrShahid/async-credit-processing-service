@@ -60,9 +60,13 @@ def get_database(client: MongoClient[Document], settings: Settings) -> Database[
 
 def ensure_indexes(db: Database[Document]) -> None:
     db.users.create_index([("user_id", ASCENDING)], unique=True)
+    # Idempotency keys are scoped to the API client that sent them.
     db.credit_operations.create_index(
-        [("idempotency_key", ASCENDING)],
+        [("client_id", ASCENDING), ("idempotency_key", ASCENDING)],
         unique=True,
         partialFilterExpression={"idempotency_key": {"$type": "string"}},
     )
-    db.credit_operations.create_index([("status", ASCENDING), ("last_enqueued_at", ASCENDING)])
+    # Dispatcher claims, oldest first.
+    db.credit_operations.create_index([("status", ASCENDING), ("next_dispatch_at", ASCENDING)])
+    # Backlog metrics: oldest pending credit.
+    db.credit_operations.create_index([("status", ASCENDING), ("created_at", ASCENDING)])
