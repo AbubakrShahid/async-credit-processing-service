@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.13.5"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint and type-check
+        run: make lint typecheck
+
+      - name: Start MongoDB and RabbitMQ
+        run: docker compose up -d --wait mongo rabbitmq
+
+      - name: Unit and integration tests
+        run: make test
+
+      - name: Build and start the full stack
+        run: docker compose up -d --build --wait
+
+      - name: Smoke test
+        run: make seed smoke
+
+      - name: Service logs
+        if: failure()
+        run: docker compose logs

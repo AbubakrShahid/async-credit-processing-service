@@ -1,4 +1,4 @@
-.PHONY: up down logs ps lint fmt typecheck test test-unit test-integration
+.PHONY: up down logs ps seed smoke check lint fmt typecheck test test-unit test-integration
 
 up:
 	docker compose up -d --build --wait
@@ -11,6 +11,14 @@ logs:
 
 ps:
 	docker compose ps
+
+seed:
+	docker compose exec api python -m credit_service.seed
+
+smoke:
+	python3 scripts/smoke_test.py
+
+check: lint typecheck test
 
 lint:
 	uv run ruff check .
