@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     sweep_batch_size: int = 100
 
     log_level: str = "INFO"
+    log_format: str = "json"  # or "console" for local development
 
 
 @lru_cache

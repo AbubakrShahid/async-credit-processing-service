@@ -19,6 +19,12 @@ services:
     <<: *app
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   worker:
     <<: *app

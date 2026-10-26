@@ -1,13 +1,14 @@
-import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+
+import structlog
 
 from credit_service.errors import CreditNotFoundError, UserNotFoundError
 from credit_service.models import ApplyOutcome, CreditOperation, User
 from credit_service.repository import CreditRepository
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 type Enqueue = Callable[[str], None]
 
@@ -26,14 +27,18 @@ class CreditService:
         self, user_id: str, amount: Decimal, idempotency_key: str | None = None
     ) -> CreditOperation:
         operation, created = self._repository.create_operation(user_id, amount, idempotency_key)
+        log = logger.bind(task_id=operation.task_id, user_id=user_id)
         if not created:
+            log.info("credit_replayed", idempotency_key=idempotency_key)
             return operation
         try:
             self._enqueue(operation.task_id)
         except Exception:
             # The operation is already durable in MongoDB, so the request is accepted
             # either way; the sweeper republishes it once it counts as stale.
-            logger.exception("Failed to publish credit %s", operation.task_id)
+            log.exception("credit_publish_failed")
+        else:
+            log.info("credit_accepted", amount=str(amount))
         return operation
 
     def apply_credit(self, task_id: str) -> ApplyOutcome:
@@ -49,7 +54,7 @@ class CreditService:
             return self._fail(task_id, str(exc))
 
         if outcome is ApplyOutcome.NOT_FOUND:
-            logger.warning("Credit %s does not exist; dropping task", task_id)
+            logger.warning("credit_not_found", task_id=task_id)
         return outcome
 
     def requeue_stale_credits(self, stale_after: timedelta, limit: int) -> int:
@@ -64,12 +69,12 @@ class CreditService:
                 self._enqueue(task_id)
             except Exception:
                 # Claimed but unpublished credits become stale again and are retried.
-                logger.exception("Requeue failed with %d credits left", len(task_ids) - published)
+                logger.exception("credit_requeue_failed", remaining=len(task_ids) - published)
                 return published
         return len(task_ids)
 
     def _fail(self, task_id: str, reason: str) -> ApplyOutcome:
-        logger.error("Credit %s failed: %s", task_id, reason)
+        logger.error("credit_failed", task_id=task_id, reason=reason)
         self._repository.fail_credit(task_id, reason)
         return ApplyOutcome.FAILED
 
