@@ -2,6 +2,7 @@ from decimal import Decimal
 
 import pytest
 from bson import Decimal128
+from pymongo import MongoClient
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
@@ -20,3 +21,10 @@ def test_user_id_is_unique(db: Database[Document]) -> None:
     db.users.insert_one({"user_id": "u_1"})
     with pytest.raises(DuplicateKeyError):
         db.users.insert_one({"user_id": "u_1"})
+
+
+def test_writes_require_majority_journaled_acknowledgement(
+    mongo_client: MongoClient[Document],
+) -> None:
+    # Durability must not depend on whatever default the cluster happens to have.
+    assert mongo_client.write_concern.document == {"w": "majority", "j": True}

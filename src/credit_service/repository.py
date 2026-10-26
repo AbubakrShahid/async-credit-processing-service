@@ -8,6 +8,8 @@ from pymongo import ASCENDING, MongoClient, ReturnDocument
 from pymongo.client_session import ClientSession
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
+from pymongo.read_concern import ReadConcern
+from pymongo.write_concern import WriteConcern
 
 from credit_service.config import Settings
 from credit_service.db import Document
@@ -72,9 +74,16 @@ class CreditRepository:
         never executed twice. If the outcome is still unknown when its retry window closes,
         the error propagates; callers treat it as transient, and every write here is a
         guarded state transition, so running the operation again is safe.
+
+        Snapshot reads with majority commits: a transaction never decides based on data a
+        failover could roll back, and its writes are durable once it returns.
         """
         with self._client.start_session() as session:
-            return session.with_transaction(callback)
+            return session.with_transaction(
+                callback,
+                read_concern=ReadConcern("snapshot"),
+                write_concern=WriteConcern("majority", j=True),
+            )
 
     # --- accepting credits -------------------------------------------------------------
 
