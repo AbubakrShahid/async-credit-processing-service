@@ -43,3 +43,8 @@ def get_database(client: MongoClient[Document], settings: Settings) -> Database[
 
 def ensure_indexes(db: Database[Document]) -> None:
     db.users.create_index([("user_id", ASCENDING)], unique=True)
+    db.credit_operations.create_index(
+        [("idempotency_key", ASCENDING)],
+        unique=True,
+        partialFilterExpression={"idempotency_key": {"$type": "string"}},
+    )

@@ -17,8 +17,12 @@ class CreditService:
         self._repository = repository
         self._enqueue = enqueue
 
-    def submit_credit(self, user_id: str, amount: Decimal) -> CreditOperation:
-        operation = self._repository.create_operation(user_id, amount)
+    def submit_credit(
+        self, user_id: str, amount: Decimal, idempotency_key: str | None = None
+    ) -> CreditOperation:
+        operation, created = self._repository.create_operation(user_id, amount, idempotency_key)
+        if not created:
+            return operation
         try:
             self._enqueue(operation.task_id)
         except Exception:

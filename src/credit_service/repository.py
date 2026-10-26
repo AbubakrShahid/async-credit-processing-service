@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -5,14 +6,19 @@ from decimal import Decimal
 from pymongo import MongoClient, ReturnDocument
 from pymongo.client_session import ClientSession
 from pymongo.database import Database
+from pymongo.errors import DuplicateKeyError
 
 from credit_service.db import Document
-from credit_service.errors import UserNotFoundError
+from credit_service.errors import IdempotencyConflictError, UserNotFoundError
 from credit_service.models import ApplyOutcome, CreditOperation, CreditStatus
 
 
 def new_task_id() -> str:
     return f"cr_{uuid.uuid4().hex}"
+
+
+def request_fingerprint(user_id: str, amount: Decimal) -> str:
+    return hashlib.sha256(f"{user_id}:{amount:f}".encode()).hexdigest()
 
 
 def settle_user_pipeline(
@@ -40,8 +46,20 @@ class CreditRepository:
         self._users = db.users
         self._operations = db.credit_operations
 
-    def create_operation(self, user_id: str, amount: Decimal) -> CreditOperation:
-        """Record a pending credit and mark the user as processing, atomically."""
+    def create_operation(
+        self, user_id: str, amount: Decimal, idempotency_key: str | None = None
+    ) -> tuple[CreditOperation, bool]:
+        """Record a pending credit and mark the user as processing, atomically.
+
+        Returns the operation and whether it was created. With an idempotency key that
+        was already used for the same request, the original operation is returned instead.
+        """
+        fingerprint = request_fingerprint(user_id, amount)
+        if idempotency_key is not None:
+            existing = self._find_by_idempotency_key(idempotency_key, fingerprint)
+            if existing is not None:
+                return existing, False
+
         now = datetime.now(UTC)
         doc: Document = {
             "_id": new_task_id(),
@@ -54,6 +72,8 @@ class CreditRepository:
             "updated_at": now,
             "processed_at": None,
         }
+        if idempotency_key is not None:
+            doc |= {"idempotency_key": idempotency_key, "request_fingerprint": fingerprint}
 
         def txn(session: ClientSession) -> None:
             result = self._users.update_one(
@@ -68,8 +88,25 @@ class CreditRepository:
                 raise UserNotFoundError(user_id)
             self._operations.insert_one(doc, session=session)
 
-        with self._client.start_session() as session:
-            session.with_transaction(txn)
+        try:
+            with self._client.start_session() as session:
+                session.with_transaction(txn)
+        except DuplicateKeyError:
+            # A concurrent request with the same idempotency key committed first.
+            if idempotency_key is None:
+                raise
+            existing = self._find_by_idempotency_key(idempotency_key, fingerprint)
+            if existing is None:
+                raise
+            return existing, False
+        return CreditOperation.from_document(doc), True
+
+    def _find_by_idempotency_key(self, key: str, fingerprint: str) -> CreditOperation | None:
+        doc = self._operations.find_one({"idempotency_key": key})
+        if doc is None:
+            return None
+        if doc["request_fingerprint"] != fingerprint:
+            raise IdempotencyConflictError(key)
         return CreditOperation.from_document(doc)
 
     def apply_credit(self, task_id: str) -> ApplyOutcome:
