@@ -10,7 +10,9 @@ from fastapi.testclient import TestClient
 from pymongo.database import Database
 
 from credit_service.api.app import app
+from credit_service.celery_app import enqueue_credit
 from credit_service.db import Document
+from credit_service.services import CreditService
 from credit_service.worker import celery_app
 
 
@@ -50,3 +52,26 @@ def test_credit_is_applied_by_worker(
     user = db.users.find_one({"user_id": "u_123"})
     assert user is not None
     assert (user["balance"], user["status"]) == (Decimal("150.00"), "processed")
+
+
+def test_message_redelivered_after_commit_is_a_no_op(
+    worker: None, service: CreditService, db: Database[Document], make_user: Callable[..., str]
+) -> None:
+    make_user("u_123", balance=Decimal("100.00"))
+    operation = service.submit_credit("u_123", Decimal("50.00"))
+    service.apply_credit(operation.task_id)
+
+    # The same message arrives again through RabbitMQ, as after a crash before the ack.
+    enqueue_credit(operation.task_id)
+    marker = service.submit_credit("u_123", Decimal("1.00"))
+    enqueue_credit(marker.task_id)
+
+    def marker_processed() -> bool:
+        doc = db.credit_operations.find_one({"_id": marker.task_id})
+        return doc is not None and doc["status"] == "processed"
+
+    # Prefetch is 1 and the queue is FIFO, so once the marker is done the duplicate was too.
+    wait_for(marker_processed)
+    user = db.users.find_one({"user_id": "u_123"})
+    assert user is not None
+    assert user["balance"] == Decimal("151.00")
