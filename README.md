@@ -103,6 +103,7 @@ location: /credits/cr_09c88385ea4a4193885f78f8caf8bbf3
 
 1. **Accept.** Requests are checked first: if the queue is backlogged the API returns `503`, and if the user already has too many credits in flight it returns `429`. Nothing is saved in either case. Then one transaction inserts the credit (`processing`) and increments the user's `pending_credits`. The API publishes only the credit ID to RabbitMQ and waits for the broker to confirm it, then records `published_at`. If publishing fails, the API still returns 202, and it stops trying to publish for 5s so that later requests don't each wait on a broker that is down.
 2. **Apply.** The worker runs one transaction that moves the credit from `processing` to `processed` **only if it is still `processing`**, adds the amount to the balance (creating the field if needed) and decrements `pending_credits`. The worker acks the message only after this commits, so a redelivered or duplicate message does nothing.
+   - **Group commit:** the same transaction also settles up to 99 more pending credits of the **same user**, oldest first. Every credit writes that user's document, so settling them one transaction each makes a busy account's transactions collide and retry; together, N credits cost one write. Each credit is still guarded individually, and records which transaction settled it (`settled_by`). When their own messages arrive later, they find the credits processed and do nothing. If something in another credit breaks the batch, the worker settles the triggering credit on its own, so one bad record can't block an account.
 3. **Dispatch.** Every 15s, Celery beat runs the dispatcher. It claims due credits in batches of 500, oldest first. Each claim gets a unique token and a 60s lease, so two dispatchers can't take the same credit. It keeps going until nothing is due, for up to 10s per run. There are two kinds of due credits:
    - **Never confirmed by the broker:** published after a 10s grace period. This covers a broker outage and an API crash between commit and publish.
    - **Confirmed but still unprocessed after 15 minutes:** republished **only while the queue is (nearly) empty**. When the queue is deep, the message is almost certainly still waiting in it, and republishing would only make the backlog worse.
@@ -130,7 +131,7 @@ The integration tests run against real MongoDB and RabbitMQ, because transaction
 ```bash
 uv sync
 make up            # or just: docker compose up -d --wait mongo rabbitmq
-make check         # ruff + mypy --strict + all 89 tests (about 10s)
+make check         # ruff + mypy --strict + all 94 tests (about 12s)
 make alerts-check  # validate and unit-test the Prometheus alert rules
 make test-unit     # no infrastructure needed
 ```
@@ -141,6 +142,7 @@ make test-unit     # no infrastructure needed
 | Commit reply lost (`UnknownTransactionCommitResult`) in the worker | Commit succeeds, then the error is injected | Retried; the second run does nothing; balance, status and pending count are all correct |
 | Commit reply lost at the API | Same injection | `503`; a retry with the same key gets the same credit; the dispatcher publishes it |
 | Same message delivered twice, or to 8 workers at once | Direct calls and threads | Exactly one applies it |
+| Group commit: one credit settles the user's other pending credits; batch size limit; other users and parked credits excluded; 80 credits applied by 8 threads at once; one corrupt record in the account | Direct calls and threads | Every credit settled exactly once; balance and `pending_credits` exact; the corrupt record doesn't block the others |
 | Apply and fail racing on the same credit | Threads | One terminal state; balance and pending count agree with it |
 | RabbitMQ down when the API publishes | Failing publisher, and a real worker | Dispatched after the grace period, then applied |
 | 10,000 never-published credits | Bulk insert, one dispatcher run | All published, none twice, in under 10s |
@@ -180,7 +182,7 @@ Also checked by hand on the Docker stack. Each drill ended with every balance ex
 
 ## Known limits and production deployment
 
-- **A very busy single account is a bottleneck.** Every credit writes the same user document, so throughput for one user is limited (about 100–150 credits/s on a laptop). `429` stops its backlog from growing without limit. If production needed more, credits could become ledger entries with the balance computed from them. That changes the `balance` contract, so it isn't done here.
+- **A very busy single account.** Group commit roughly doubled how fast one account settles: on the same laptop, back to back, it went from 76 to 145 credits/s, and 2,487 instead of 1,465 out of 3,000 were accepted before `429`. A 3,000-credit backlog across 50 users settled in 50 transactions. The remaining limit is on the accept side: step 2 of the brief updates the user document for every accepted credit, which caps one account at about 170–210 accepted requests/s here. `429` keeps that account's backlog bounded. Going further would mean splitting a hot account's balance across several documents, or not touching the user document when a credit is accepted. Both change the brief's data contract, so they're documented rather than built.
 - **Measured locally:** about 315 requests/s accepted across 100 users, with 1 API process and 4 workers. That's a laptop number, not a capacity guarantee. Production capacity would come from running more API and worker instances, and should be benchmarked on real hardware.
 - **Security (the defaults here are for local demonstration only):** the `local-dev-key` API key, RabbitMQ's `guest/guest` login and the MongoDB instance without authentication exist so reviewers can run everything with one command, and compose publishes the MongoDB and RabbitMQ ports only so you can inspect them. Production would put the API behind an identity provider (OAuth2 or mTLS at a gateway), authorise which clients may credit which users, load credentials from a secrets manager, use TLS on every connection, and keep the broker and database on a private network.
 - **High availability:** production needs a 3-node replica set with majority writes, RabbitMQ quorum queues, several API and worker instances, and a single beat (concurrent dispatchers are safe, but you only need one).
@@ -200,6 +202,7 @@ These environment variables are read by the API, the worker and beat. Local runs
 | `PUBLISH_PAUSE_SECONDS` | `5` | How long the API stops publishing after a failed publish |
 | `TASK_MAX_RETRIES` / `RETRY_BACKOFF_SECONDS` / `RETRY_BACKOFF_MAX_SECONDS` | `5` / `1` / `60` | Retries for transient errors |
 | `MAX_CRASHES` / `TASK_TIME_LIMIT_SECONDS` | `10` / `300` | Crashes before a credit is parked for an operator, and the hard time limit per task |
+| `APPLY_BATCH_SIZE` | `100` | Pending credits of one user settled together in one transaction (group commit); `1` turns it off |
 | `DISPATCH_INTERVAL_SECONDS` / `DISPATCH_TIME_BUDGET_SECONDS` / `DISPATCH_BATCH_SIZE` | `15` / `10` / `500` | How often the dispatcher runs, how long each run may take, and the batch size |
 | `PUBLISH_GRACE_SECONDS` / `REPUBLISH_AFTER_SECONDS` / `RECONCILE_MAX_QUEUE_DEPTH` | `10` / `900` / `100` | When unconfirmed and confirmed credits become due, and the queue depth below which confirmed credits may be republished |
 | `DISPATCH_LEASE_SECONDS` | `60` | How long a dispatcher's claim lasts |

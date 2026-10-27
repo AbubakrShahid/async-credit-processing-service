@@ -73,5 +73,9 @@ def ensure_indexes(db: Database[Document]) -> None:
     )
     # Dispatcher claims, oldest first.
     db.credit_operations.create_index([("status", ASCENDING), ("next_dispatch_at", ASCENDING)])
+    # Group commit: a user's pending credits, oldest first.
+    db.credit_operations.create_index(
+        [("user_id", ASCENDING), ("status", ASCENDING), ("created_at", ASCENDING)]
+    )
     # Backlog metrics: oldest pending credit.
     db.credit_operations.create_index([("status", ASCENDING), ("created_at", ASCENDING)])

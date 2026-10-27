@@ -24,6 +24,7 @@ from credit_service.models import (
     BacklogStats,
     CreditOperation,
     CreditStatus,
+    Settlement,
     User,
 )
 
@@ -37,16 +38,17 @@ def request_fingerprint(user_id: str, amount: Decimal) -> str:
 
 
 def settle_user_pipeline(
-    outcome: CreditStatus, now: datetime, credit: Decimal | None = None
+    outcome: CreditStatus, now: datetime, credit: Decimal | None = None, settled: int = 1
 ) -> list[Document]:
-    """Update pipeline that settles one pending credit on the user document.
+    """Update pipeline that settles pending credits on the user document.
 
-    Adds the credit to the balance (creating the field if missing), decrements
+    Adds `credit` to the balance (creating the field if missing), takes `settled` off
     pending_credits, and derives status: `processing` while other credits are still in
-    flight, otherwise the outcome of this operation.
+    flight, otherwise the outcome of this settlement.
     """
+    remaining = {"$subtract": [{"$ifNull": ["$pending_credits", 0]}, settled]}
     settle: Document = {
-        "pending_credits": {"$max": [0, {"$subtract": [{"$ifNull": ["$pending_credits", 0]}, 1]}]},
+        "pending_credits": {"$max": [0, remaining]},
         "updated_at": now,
     }
     if credit is not None:
@@ -237,18 +239,47 @@ class CreditRepository:
         )
         return result.modified_count == 1
 
-    def apply_credit(self, task_id: str) -> ApplyOutcome:
-        """Apply a pending credit to the user's balance at most once.
+    def apply_credit(self, task_id: str, *, batch_limit: int = 1) -> Settlement:
+        """Apply a pending credit, at most once, with up to `batch_limit - 1` other pending
+        credits of the same user in the same transaction (group commit).
 
-        The operation's `processing -> processed` transition and the balance update
-        commit together. A redelivered message finds the operation already settled and
-        changes nothing, so a worker crash between commit and ack cannot double-credit.
+        Each credit's `processing -> processed` transition commits together with the
+        balance update, so a redelivered message finds its credit settled and changes
+        nothing: a worker crash between commit and ack cannot double-credit.
+
+        Batching exists because every credit writes the same user document: settled one
+        transaction each, a busy account's transactions collide and retry. Settled
+        together, N credits cost one user-document write. Credits are summed in Decimal
+        and their order doesn't matter, because credits only add.
         """
 
-        def txn(session: ClientSession) -> ApplyOutcome:
+        def txn(session: ClientSession) -> Settlement:
             now = datetime.now(UTC)
-            operation = self._operations.find_one_and_update(
-                {"_id": task_id, "status": CreditStatus.PROCESSING},
+            trigger = self._operations.find_one(
+                {"_id": task_id}, {"user_id": True, "status": True, "amount": True}, session=session
+            )
+            if trigger is None:
+                return Settlement(ApplyOutcome.NOT_FOUND, 0)
+            if trigger["status"] != CreditStatus.PROCESSING:
+                return Settlement(ApplyOutcome.ALREADY_SETTLED, 0)
+
+            batch = [trigger]
+            if batch_limit > 1:
+                others = self._operations.find(
+                    {
+                        "user_id": trigger["user_id"],
+                        "status": CreditStatus.PROCESSING,
+                        "parked_at": None,
+                        "_id": {"$ne": task_id},
+                    },
+                    {"amount": True},
+                    session=session,
+                )
+                batch += others.sort("created_at", ASCENDING).limit(batch_limit - 1)
+            ids = [credit["_id"] for credit in batch]
+
+            settled = self._operations.update_many(
+                {"_id": {"$in": ids}, "status": CreditStatus.PROCESSING},
                 {
                     "$set": {
                         "status": CreditStatus.PROCESSED,
@@ -256,23 +287,26 @@ class CreditRepository:
                         "updated_at": now,
                         "in_flight_since": None,
                         "error": None,
+                        "settled_by": task_id,
                     }
                 },
-                return_document=ReturnDocument.AFTER,
                 session=session,
             )
-            if operation is None:
-                exists = self._operations.count_documents({"_id": task_id}, session=session)
-                return ApplyOutcome.ALREADY_SETTLED if exists else ApplyOutcome.NOT_FOUND
+            # Snapshot isolation: if another transaction settled any of these credits
+            # after our snapshot, this write aborts with a write conflict and the whole
+            # transaction is retried; it never silently skips a credit.
+            if settled.modified_count != len(ids):
+                raise RuntimeError(f"settled {settled.modified_count} of {len(ids)} credits")
 
+            total = sum((credit["amount"] for credit in batch), Decimal("0.00"))
             result = self._users.update_one(
-                {"user_id": operation["user_id"]},
-                settle_user_pipeline(CreditStatus.PROCESSED, now, credit=operation["amount"]),
+                {"user_id": trigger["user_id"]},
+                settle_user_pipeline(CreditStatus.PROCESSED, now, credit=total, settled=len(ids)),
                 session=session,
             )
             if result.matched_count == 0:
-                raise UserNotFoundError(operation["user_id"])
-            return ApplyOutcome.APPLIED
+                raise UserNotFoundError(trigger["user_id"])
+            return Settlement(ApplyOutcome.APPLIED, len(ids))
 
         return self._transaction(txn)
 

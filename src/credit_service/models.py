@@ -53,6 +53,12 @@ class CreditOperation:
 
 
 @dataclass(frozen=True, slots=True)
+class Settlement:
+    outcome: ApplyOutcome
+    settled: int  # credits moved to processed by this transaction
+
+
+@dataclass(frozen=True, slots=True)
 class AttemptState:
     attempts: int
     crashes: int

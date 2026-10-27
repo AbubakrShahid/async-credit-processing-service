@@ -83,12 +83,12 @@ def test_transient_mongo_error_is_retried(
     real_apply = CreditRepository.apply_credit
     calls = 0
 
-    def flaky_apply(self: CreditRepository, task_id: str) -> object:
+    def flaky_apply(self: CreditRepository, task_id: str, **kwargs: Any) -> object:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise AutoReconnect("primary stepped down")
-        return real_apply(self, task_id)
+        return real_apply(self, task_id, **kwargs)
 
     monkeypatch.setattr(CreditRepository, "apply_credit", flaky_apply)
     monkeypatch.setattr(worker_module, "retry_delay", lambda *_: 0)

@@ -7,7 +7,14 @@ from pymongo.errors import PyMongoError
 
 from credit_service.config import Settings
 from credit_service.errors import CreditNotFoundError, ServiceOverloadedError, UserNotFoundError
-from credit_service.models import ApplyOutcome, BacklogStats, CreditOperation, DispatchReport, User
+from credit_service.models import (
+    ApplyOutcome,
+    BacklogStats,
+    CreditOperation,
+    DispatchReport,
+    Settlement,
+    User,
+)
 from credit_service.repository import CreditRepository
 
 logger = structlog.get_logger(__name__)
@@ -109,10 +116,28 @@ class CreditService:
             return ApplyOutcome.PARKED
 
         try:
-            return self._repository.apply_credit(task_id)
+            settlement = self._settle(task_id)
         except UserNotFoundError as exc:
             # The user was deleted after the credit was accepted; retrying won't help.
             return self._fail(task_id, str(exc))
+        if settlement.settled > 1:
+            logger.info("credits_settled_together", task_id=task_id, settled=settlement.settled)
+        return settlement.outcome
+
+    def _settle(self, task_id: str) -> Settlement:
+        batch_limit = self._settings.apply_batch_size
+        try:
+            return self._repository.apply_credit(task_id, batch_limit=batch_limit)
+        except (PyMongoError, UserNotFoundError):
+            raise  # transient: retried by the caller; business error: handled above
+        except Exception:
+            if batch_limit == 1:
+                raise
+            # Something in another credit of this user broke the batch. Settle this one on
+            # its own so a single bad record can't block the whole account; the bad credit
+            # fails in its own execution and ends up parked.
+            logger.warning("batch_settlement_failed", task_id=task_id, exc_info=True)
+            return self._repository.apply_credit(task_id, batch_limit=1)
 
     def record_failed_attempt(self, task_id: str, exc: BaseException, *, transient: bool) -> None:
         """Best effort: MongoDB may be the thing that is failing."""

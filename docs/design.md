@@ -39,7 +39,7 @@ A single `status` on the user can't describe two credits in flight at once. So t
 ## 4. Lifecycle
 
 1. **Accept.** The API returns `503` if the queue backlog is above its limit, and `429` if the user already has 1,000 credits in flight; nothing is saved in either case. Then one transaction inserts the credit and increments `pending_credits` (an unknown user gets `404`). The API publishes **only the credit id**, which is also the Celery task id, waits for the broker to confirm it, and records `published_at`. If publishing fails, the credit is already saved, so the API still answers `202`. It then stops publishing for 5s, so that during an outage requests don't each wait on the broker.
-2. **Apply.** One transaction moves the credit from `processing` to `processed`, **only if it is still `processing`**. It sets `balance = ifNull(balance, 0) + amount` (which creates the field) and decrements `pending_credits`. The worker acks the message after the commit.
+2. **Apply.** One transaction moves the credit from `processing` to `processed`, **only if it is still `processing`**. It sets `balance = ifNull(balance, 0) + amount` (which creates the field) and decrements `pending_credits`. The worker acks after the commit. **Group commit:** the transaction also settles up to 99 more pending credits of the same user, each guarded the same way, so a busy account pays one user-document write per batch instead of one per credit.
 3. **Dispatch.** The credit document doubles as the outbox, so there is no extra table or relay service. Each run claims due credits oldest-first in batches of 500, stamping each claim with a token and a 60s lease, and keeps going until nothing is due or 10s have passed. Credits that were **never confirmed by the broker** are published after a 10s grace period. Credits that were **confirmed but are still unprocessed after 15 minutes** are republished only while the queue is (nearly) drained. A deep queue means their message is almost certainly still waiting, and republishing would feed the backlog. If the broker fails mid-batch, the run records the credits already published, releases the rest and stops; the next run tries again.
 
 ## 5. Failure handling
@@ -56,7 +56,7 @@ A single `status` on the user can't describe two credits in flight at once. So t
 
 ## 6. Testing and verification
 
-The 89 tests run against **real MongoDB and RabbitMQ**, because transactions, write conflicts and redelivery are exactly what's being tested, and mocks would only repeat my own assumptions. Each failure in §5 is reproduced at the boundary where it happens: a real consumer commits and drops its connection without acking; a commit succeeds and then reports `UnknownTransactionCommitResult`; a dispatcher dies between publishing and recording; the queue depth is forced to show a backlog. CI runs ruff, `mypy --strict`, the tests, an image build and a smoke test.
+The 94 tests run against **real MongoDB and RabbitMQ**, because transactions, write conflicts and redelivery are exactly what's being tested, and mocks would only repeat my own assumptions. Each failure in §5 is reproduced at the boundary where it happens: a real consumer commits and drops its connection without acking; a commit succeeds and then reports `UnknownTransactionCommitResult`; a dispatcher dies between publishing and recording; the queue depth is forced to show a backlog. CI runs ruff, `mypy --strict`, the tests, an image build and a smoke test.
 
 Concurrency tests read snapshot transactions *while processing runs* to check that the balance always equals the opening balance plus processed credits, and that `pending_credits` always equals the number of credits in flight. Each key guard was broken on purpose and its tests failed. Drills on the Docker stack:
 
@@ -67,7 +67,6 @@ Concurrency tests read snapshot transactions *while processing runs* to check th
 
 ## 7. Trade-offs, limits and production deployment
 
-- **A very busy single account is a bottleneck.** Every credit writes the same user document (about 100–150/s per account on a laptop), and `429` keeps its backlog bounded. A ledger with a computed balance would remove this limit, but it changes the `balance` contract the brief asks for, so I documented it rather than building it.
-- **Throughput:** about 315 requests/s on a laptop (1 API process, 4 workers). That isn't a capacity claim: everything scales horizontally, and production needs its own benchmark.
-- **Deployment:** a 3-node replica set with majority writes, RabbitMQ quorum queues, several API and worker instances, and secrets and TLS for the real credentials.
+- **A very busy single account:** group commit doubled one account's settlement rate (76 → 145 credits/s on a laptop). Accepting is the remaining limit, at about 200 requests/s per account, because the brief's step 2 writes the user document per credit; `429` bounds the backlog. Going further means splitting a hot account's balance, which changes the data contract.
+- **Scale and deployment:** about 300 requests/s on a laptop (1 API process, 4 workers) is not a capacity claim. Production adds API and worker instances, a 3-node replica set, RabbitMQ quorum queues, secrets and TLS, and is benchmarked on its own hardware.
 - **Operations:** `/metrics` gauges are read from MongoDB, so they cover every process. `ops/prometheus-alerts.yml` turns them into tested alerts, each saying what to do; a parked credit pages someone. Credit records are the audit trail: archive them, never expire them with a TTL, and reconcile balances against them.

@@ -42,8 +42,11 @@ def test_adds_to_existing_balance_without_float_drift(
 
 
 def test_user_stays_processing_while_other_credits_are_pending(
-    service: CreditService, db: Database[Document], make_user: Callable[..., str]
+    make_service: Callable[..., CreditService],
+    db: Database[Document],
+    make_user: Callable[..., str],
 ) -> None:
+    service = make_service(apply_batch_size=1)  # settle one credit at a time
     make_user("u_123")
     first = service.submit_credit("u_123", Decimal("10"))
     second = service.submit_credit("u_123", Decimal("5"))

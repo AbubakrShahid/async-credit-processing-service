@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     retry_backoff_seconds: float = 1.0
     retry_backoff_max_seconds: float = 60.0
     max_crashes: int = 10
+    # Group commit: a worker settles up to this many pending credits of the same user in
+    # one transaction, so a busy account isn't throttled by one user-document write each.
+    apply_batch_size: int = 100
     task_time_limit_seconds: int = 300
 
     # Dispatcher: publishes credits whose publish never got confirmed, and, only while the
