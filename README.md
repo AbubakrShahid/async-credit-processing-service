@@ -1,226 +1,373 @@
 # Async Credit Processing Service
 
-A client asks to credit a user's balance. The API records the request and answers `202 Accepted` straight away, and a Celery worker applies the credit in the background. Each credit is applied **at most once**. That holds even when RabbitMQ redelivers a message, a worker crashes mid-task, a commit reply is lost, or the client retries. A credit that was accepted is never dropped: if its message is lost or never published, it is published again.
+A reliable asynchronous credit-processing service built with **FastAPI, Celery, RabbitMQ, and MongoDB**.
 
-**Stack:** Python 3.12, FastAPI, Celery, RabbitMQ, MongoDB 8.2 (replica set), Docker Compose
+The API accepts a credit request, saves it, and returns `202 Accepted` without waiting for the balance update. A Celery worker processes the credit in the background, while MongoDB tracks its status.
 
-The design and its trade-offs are explained in [docs/design.pdf](docs/design.pdf).
+The main engineering challenge is ensuring that **each credit changes the balance only once**, even when requests are retried, messages are delivered multiple times, or infrastructure fails.
 
+**Tech Stack:** Python 3.12 · FastAPI · Celery · RabbitMQ · MongoDB 8.2 · Docker Compose
+
+**[Two-Page Architecture & Design Document](docs/design.pdf)**
+
+## Architecture
+
+```text
+                         Client
+                           |
+                     POST /credits
+                           |
+                           v
+                        FastAPI
+                           |
+                +----------+----------+
+                |                     |
+                v                     v
+             MongoDB               RabbitMQ
+         Save credit request       Task queue
+                ^                     |
+                |                     v
+                |                 Celery Worker
+                |                     |
+                +---------------------+
+                 Update balance and
+                 mark credit processed
+
+         Celery Beat (every 15s)
+                   |
+                   v
+               Dispatcher
+                   |
+          Recover pending tasks
 ```
-client ──POST /credits──▶ API ──(1) txn──▶ MongoDB   credit: processing · user: pending_credits+1
-                           └──(2) publish id, confirmed──▶ RabbitMQ ──▶ Celery worker
-                                                                           │
-                MongoDB ◀──(3) one txn: credit processed + balance += amount ┘ (ack after commit)
-   beat ──every 15s──▶ dispatcher: publishes credits whose publish was never confirmed
-```
 
-## Quick start
+### How it works
 
-You need **Docker** with Compose v2. To run the tests you also need [uv](https://docs.astral.sh/uv/) (`brew install uv`).
+1. **Accept:** FastAPI validates the request and saves a credit operation with `processing` status in MongoDB.
+2. **Publish:** The API publishes the credit ID to RabbitMQ and returns `202 Accepted`. If publishing fails, the credit remains saved for later recovery.
+3. **Process:** A Celery worker reads the credit and updates the user's balance and operation status in one MongoDB transaction.
+4. **Acknowledge:** The worker acknowledges the RabbitMQ message only after the transaction commits.
+5. **Recover:** A scheduled dispatcher republishes credits that were never confirmed by RabbitMQ or may require recovery.
+
+MongoDB is the source of truth. RabbitMQ handles message delivery, and Celery executes background tasks.
+
+Each credit has its own operation record, allowing multiple credits for the same user to be tracked independently.
+
+## Quick Start
+
+### Prerequisites
+
+- Docker with Docker Compose v2
+- [uv](https://docs.astral.sh/uv/) for running tests locally
+
+No MongoDB Atlas account or cloud services are required.
+
+### Run the application
 
 ```bash
-make up      # build and start MongoDB, RabbitMQ, API, worker, beat; waits until healthy
-make seed    # create demo users u_123 (balance 100.00), u_new (no balance yet), u_alice
-make smoke   # submit a credit end to end and check the balance moved by exactly 50.00
+make up       # Build and start all services
+make seed     # Create demo users
+make smoke    # Verify credit processing end to end
 ```
 
-| What | Where |
+The Docker environment starts FastAPI, MongoDB, RabbitMQ, a Celery worker, and Celery Beat.
+
+### Available services
+
+| Service | URL / Connection |
 |---|---|
-| Swagger UI | http://localhost:8000/docs. Click **Authorize** and enter `local-dev-key`. |
-| Prometheus metrics | http://localhost:8000/metrics |
-| RabbitMQ management | http://localhost:15672 (guest / guest) |
+| Swagger UI | http://localhost:8000/docs |
+| RabbitMQ Management | http://localhost:15672 |
+| Prometheus Metrics | http://localhost:8000/metrics |
 | MongoDB | `mongodb://localhost:27017/?replicaSet=rs0&directConnection=true` |
 
-`make logs` follows all the services. `make down` stops everything and **deletes the data volumes**.
+**Demo credentials:**
 
-## API
+- API key: `local-dev-key`
+- RabbitMQ: `guest / guest`
 
-Every `/credits` and `/users` call needs an `X-API-Key` header. Compose configures one client, `reviewer:local-dev-key`; set your own with `API_KEYS=client:key,...`.
+Open Swagger UI, click **Authorize**, and enter the API key to try the endpoints.
 
-### `POST /credits`: submit a credit
+### Useful commands
 
 ```bash
-curl -i -X POST localhost:8000/credits \
-  -H 'X-API-Key: local-dev-key' \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: 6f1c2a1e-order-42' \
-  -d '{"user_id": "u_new", "amount": "50.00"}'
+make logs           # Follow service logs
+make smoke          # Run the end-to-end smoke test
+make check          # Lint, type-check, and run all tests
+make alerts-check   # Validate and test alert rules
+make down           # Stop services and DELETE data volumes
 ```
 
-```http
-HTTP/1.1 202 Accepted
-location: /credits/cr_09c88385ea4a4193885f78f8caf8bbf3
+> **Note:** `make down` removes the local data volumes. Use it only when you want to reset the environment.
 
-{"task_id": "cr_09c88385ea4a4193885f78f8caf8bbf3", "status": "processing", "status_url": "/credits/cr_09c88385ea4a4193885f78f8caf8bbf3"}
+## API Usage
+
+All credit and user endpoints require the `X-API-Key` header.
+
+### 1. Submit a credit
+
+```bash
+curl -X POST http://localhost:8000/credits \
+  -H "X-API-Key: local-dev-key" \
+  -H "Idempotency-Key: refund-001" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"u_123","amount":"50.00"}'
 ```
 
-| Status | When |
-|---|---|
-| `202` | The credit was accepted. It is saved in MongoDB, even if the publish to RabbitMQ failed. |
-| `401` | The API key is missing or wrong. |
-| `404` | The user doesn't exist. Nothing is saved. |
-| `409` | This client already used the `Idempotency-Key` with a different body. |
-| `422` | The amount is invalid. It must be greater than 0, at most 1,000,000.00, with at most two decimal places. |
-| `429` | The user already has 1,000 credits in flight. Nothing is saved; retry after `Retry-After`. |
-| `503` | The queue is backlogged (nothing is saved), or MongoDB was briefly unavailable. Retry with the **same** `Idempotency-Key`. |
-
-`Idempotency-Key` is optional and scoped to the API client. If you retry with the same key and body, you get the original `task_id` back.
-
-### `GET /credits/{task_id}`: credit status
+Response (`202 Accepted`):
 
 ```json
 {
-  "task_id": "cr_09c88385ea4a4193885f78f8caf8bbf3",
-  "user_id": "u_new",
+  "task_id": "cr_abc123",
+  "status": "processing",
+  "status_url": "/credits/cr_abc123"
+}
+```
+
+The request is saved before the response is returned. The balance update happens asynchronously.
+
+The optional `Idempotency-Key` allows clients to retry safely. Repeating a request with the same key and body returns the original credit instead of creating another one.
+
+### 2. Check credit status
+
+```bash
+curl http://localhost:8000/credits/cr_abc123 \
+  -H "X-API-Key: local-dev-key"
+```
+
+Example response:
+
+```json
+{
+  "task_id": "cr_abc123",
+  "user_id": "u_123",
   "amount": "50.00",
   "status": "processed",
   "attempts": 1,
   "error": null,
-  "created_at": "2026-10-26T12:37:38.351000Z",
-  "processed_at": "2026-10-26T12:37:38.359000Z",
-  "published_at": "2026-10-26T12:37:38.357000Z",
+  "created_at": "2026-10-26T12:37:38Z",
+  "processed_at": "2026-10-26T12:37:39Z",
+  "published_at": "2026-10-26T12:37:38Z",
   "parked_at": null
 }
 ```
 
-`status` is `processing`, `processed` (the balance has been updated) or `failed` (the balance was not changed, and `error` says why). `published_at` is when RabbitMQ confirmed the message. `parked_at` is set if the credit was put on hold for an operator (see the failure policy below).
+A credit can be `processing`, `processed`, or `failed`. A credit placed on hold for manual investigation remains `processing` and has a `parked_at` timestamp.
 
-### `GET /users/{user_id}`: balance
+### 3. Check user balance
 
-```json
-{"user_id": "u_new", "balance": "50.00", "status": "processed", "pending_credits": 0}
+```bash
+curl http://localhost:8000/users/u_123 \
+  -H "X-API-Key: local-dev-key"
 ```
 
-### Operations
+Example response after processing:
 
-- `GET /health/live`: returns 200 while the process is running. It doesn't check any dependencies.
-- `GET /health/ready`: checks MongoDB and RabbitMQ. It returns 503 if either one can't be reached.
-- `GET /metrics`: Prometheus metrics. These gauges are read from MongoDB, so they cover every process: `credit_processing`, `credit_unpublished`, `credit_parked`, `credit_failed`, `credit_oldest_processing_age_seconds`, `credit_oldest_unpublished_age_seconds` and `credit_queue_depth`. There is also an HTTP latency histogram.
-- **Alerts:** [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml) contains Prometheus rules built on these gauges. Each rule's description says what to do when it fires. `CreditParked` pages someone, because a parked credit is money still owed that nothing will retry. The others are `CreditSettlementStalled`, `CreditsNotPublished`, `CreditsFailed`, `CreditQueueBacklog` and `CreditMetricsUnavailable`. `make alerts-check` validates and unit-tests the rules with promtool, and CI runs it too.
-- **Releasing parked credits:** once the cause is understood, run `docker compose exec api python -m credit_service.unpark <task_id> [...]`. The dispatcher republishes them with a fresh crash budget.
+```json
+{
+  "user_id": "u_123",
+  "balance": "150.00",
+  "status": "processed",
+  "pending_credits": 0
+}
+```
 
-## How it works
+Money is returned as a decimal string to preserve precision.
 
-1. **Accept.** Requests are checked first: if the queue is backlogged the API returns `503`, and if the user already has too many credits in flight it returns `429`. Nothing is saved in either case. Then one transaction inserts the credit (`processing`) and increments the user's `pending_credits`. The API publishes only the credit ID to RabbitMQ and waits for the broker to confirm it, then records `published_at`. If publishing fails, the API still returns 202, and it stops trying to publish for 5s so that later requests don't each wait on a broker that is down.
-2. **Apply.** The worker runs one transaction that moves the credit from `processing` to `processed` **only if it is still `processing`**, adds the amount to the balance (creating the field if needed) and decrements `pending_credits`. The worker acks the message only after this commits, so a redelivered or duplicate message does nothing.
-   - **Group commit:** the same transaction also settles up to 99 more pending credits of the **same user**, oldest first. Every credit writes that user's document, so settling them one transaction each makes a busy account's transactions collide and retry; together, N credits cost one write. Each credit is still guarded individually, and records which transaction settled it (`settled_by`). When their own messages arrive later, they find the credits processed and do nothing. If something in another credit breaks the batch, the worker settles the triggering credit on its own, so one bad record can't block an account.
-3. **Dispatch.** Every 15s, Celery beat runs the dispatcher. It claims due credits in batches of 500, oldest first. Each claim gets a unique token and a 60s lease, so two dispatchers can't take the same credit. It keeps going until nothing is due, for up to 10s per run. There are two kinds of due credits:
-   - **Never confirmed by the broker:** published after a 10s grace period. This covers a broker outage and an API crash between commit and publish.
-   - **Confirmed but still unprocessed after 15 minutes:** republished **only while the queue is (nearly) empty**. When the queue is deep, the message is almost certainly still waiting in it, and republishing would only make the backlog worse.
-4. **Failure policy.** Infrastructure errors **never** fail a credit. Transient MongoDB errors are retried up to 5 times with exponential backoff and jitter; after that the dispatcher picks the credit up again. Transactions are also retried in place for up to 120s by the MongoDB driver. A business error, such as the user having been deleted, fails the credit immediately. An execution that crashes the worker is counted as a crash: RabbitMQ marks the redelivered message, and the earlier execution never finished. An unexpected exception also counts as a crash. After 10 crashes the credit is **parked, not failed**: it stays `processing` (the money is still owed), stops being retried automatically, and waits for an operator. A crash loop can't tell a bad message from a restart loop, and a restart loop must not make users lose money. A failed credit leaves the balance unchanged and releases its `pending_credits`.
+### API responses
 
-## Time limits
+| Status | Meaning |
+|---|---|
+| `202` | Credit accepted for asynchronous processing |
+| `401` | Missing or invalid API key |
+| `404` | User or credit not found |
+| `409` | Idempotency key reused with different request data |
+| `422` | Invalid credit amount |
+| `429` | Too many pending credits for the user |
+| `503` | Service temporarily unavailable or overloaded |
 
-Each limit below covers something different, and they don't add up to a single request deadline:
+Clients should reuse their original idempotency key when retrying an uncertain request.
 
-| Where | Limit | When it's hit |
-|---|---|---|
-| Any single MongoDB operation, in any process | 10s (`MONGO_OPERATION_TIMEOUT_MS`) | A timeout error is raised; nothing waits forever on a dead connection |
-| All MongoDB work in one API request, including transaction retries | 10s (`API_DB_DEADLINE_SECONDS`) | `503` with `Retry-After`. With MongoDB killed, every endpoint answered in about 10s; before this cap, a `POST` without an idempotency key took 123s |
-| Publishing from the API to RabbitMQ | 2s connect timeout, up to 2 retries; publishing pauses for 5s after a failure | `202` anyway; the dispatcher publishes the credit later |
-| `/health/ready` | 2s per dependency | `503` (about 2.4s with MongoDB down) |
-| A worker's transaction | The MongoDB driver retries it in place for up to 120s | Short failovers pass without the task failing; after that, Celery retries with backoff |
-| A worker task | 300s hard limit (`TASK_TIME_LIMIT_SECONDS`) | The task is killed and counted as a crash |
+## Reliability & Design Decisions
 
-So an API request spends at most 10s waiting on MongoDB. In the worst case, with RabbitMQ hanging as well, a request still finishes in under about 20s. A worker can hold a credit for up to about 2 minutes during a database outage before handing it to Celery's retries. None of these limits ever causes a credit to fail.
+The service uses several safeguards to protect financial correctness and recover from failures.
 
-## Tests
+| Concern | Implementation |
+|---|---|
+| Duplicate message delivery | Conditional status transition and balance update in one MongoDB transaction |
+| Client retries | Per-client idempotency keys and unique database indexes |
+| Worker crashes | Late RabbitMQ acknowledgments and idempotent processing |
+| Broker outages | Database-backed recovery dispatcher |
+| Concurrent credits | MongoDB transactions and atomic balance updates |
+| Monetary precision | Python `Decimal` and MongoDB `Decimal128` |
+| Transient infrastructure failures | Retries with exponential backoff and jitter |
+| Repeated worker crashes | Park the credit for operator investigation |
+| Excessive workload | Per-user pending limits and queue backlog protection |
+| Data durability | Explicit majority-journaled MongoDB writes and durable RabbitMQ messages |
 
-The integration tests run against real MongoDB and RabbitMQ, because transactions, acks and redelivery can't be tested properly with mocks. They use a separate database (`credit_service_test`) and queue (`credits_test`).
+### Exactly-once balance effects
+
+RabbitMQ provides at-least-once delivery, meaning a task may be delivered more than once.
+
+The worker prevents duplicate financial effects by checking the credit's current status before updating the balance. Both changes commit in the same MongoDB transaction.
+
+If a worker commits a credit but crashes before acknowledging RabbitMQ, the message may be redelivered. The next worker sees that the credit is already processed and skips the balance update.
+
+**Messages may be processed more than once, but each credit can change the balance only once.**
+
+### Recovery dispatcher
+
+Celery Beat schedules the dispatcher every 15 seconds.
+
+The dispatcher handles:
+
+- **Unpublished credits:** Operations saved in MongoDB but never confirmed by RabbitMQ.
+- **Potentially lost messages:** Older, confirmed operations that remain unprocessed and may need redelivery.
+
+It uses atomic claims, leases, and bounded batches to coordinate concurrent dispatchers. Previously confirmed credits are only republished when the queue backlog is sufficiently low, avoiding unnecessary duplicate messages during congestion.
+
+The credit operation also serves as the durable outbox record, so a separate outbox collection is not required.
+
+### Group commit
+
+When many credits target the same user, separate transactions repeatedly update the same user document, creating write contention.
+
+The worker can settle up to **100 pending credits for one user in a single transaction**. Each operation retains its own status and audit information, while the user's balance is updated once with the combined amount.
+
+This improves throughput for busy accounts while preserving individual credit tracking and duplicate protection.
+
+### Failure handling
+
+Failures are handled according to their cause:
+
+- **Infrastructure failures:** Retry and recover without marking valid credits as failed.
+- **Permanent business failures:** Mark the credit as `failed` when processing is no longer valid, such as when its user has been deleted.
+- **Repeated crashes:** Park the credit rather than discarding an accepted financial obligation.
+
+Parked credits remain outstanding and require operator investigation.
+
+Once the problem is resolved, an operator can release a credit using:
+
+```bash
+docker compose exec api python -m credit_service.unpark <task_id>
+```
+
+The dispatcher then makes it eligible for processing again.
+
+## Testing
+
+The project includes **94 automated tests**, covering business rules, concurrency, message delivery, failure recovery, and the complete processing flow.
+
+Integration tests use real MongoDB and RabbitMQ instances rather than mocking their transaction and message-delivery behavior.
+
+### Run tests
 
 ```bash
 uv sync
-make up            # or just: docker compose up -d --wait mongo rabbitmq
-make check         # ruff + mypy --strict + all 94 tests (about 12s)
-make alerts-check  # validate and unit-test the Prometheus alert rules
-make test-unit     # no infrastructure needed
+make up
+make check
 ```
 
-| Scenario | How it's tested | Expected result |
-|---|---|---|
-| Worker crashes after commit, before ack | A real consumer takes the message, commits, then drops its connection; the real worker gets the redelivered message | Credited once; the redelivery does nothing |
-| Commit reply lost (`UnknownTransactionCommitResult`) in the worker | Commit succeeds, then the error is injected | Retried; the second run does nothing; balance, status and pending count are all correct |
-| Commit reply lost at the API | Same injection | `503`; a retry with the same key gets the same credit; the dispatcher publishes it |
-| Same message delivered twice, or to 8 workers at once | Direct calls and threads | Exactly one applies it |
-| Group commit: one credit settles the user's other pending credits; batch size limit; other users and parked credits excluded; 80 credits applied by 8 threads at once; one corrupt record in the account | Direct calls and threads | Every credit settled exactly once; balance and `pending_credits` exact; the corrupt record doesn't block the others |
-| Apply and fail racing on the same credit | Threads | One terminal state; balance and pending count agree with it |
-| RabbitMQ down when the API publishes | Failing publisher, and a real worker | Dispatched after the grace period, then applied |
-| 10,000 never-published credits | Bulk insert, one dispatcher run | All published, none twice, in under 10s |
-| 4 dispatchers running at once over 2,000 credits | Threads | No credit published twice |
-| Dispatcher dies after publish, before recording it | Injected failure | Republished once more; credited once |
-| Deep queue with old confirmed credits | Queue depth set to unknown, 5,000, or 0 | Republished only when the queue is drained |
-| Long MongoDB outage (20 transient failures) | Repeated failures | Never marked failed; applied once the database is back |
-| Crash loop: repeated crashes or unexpected errors | Simulated redeliveries | **Parked** (still owed, balance unchanged); skipped by the dispatcher; applied once released |
-| Client retries; same key with a different body; same key from another client | API | Same credit / `409` / a separate credit |
-| Too many credits in flight for one user; queue backlogged | API | `429` / `503`; nothing saved |
-| 40 parallel submit+apply; 30 credits through an 8-thread worker | Threads, real worker | Exact to the cent; **invariants checked from snapshots while processing runs** |
-| Invalid amounts, unknown users, missing API key | API | `422` / `404` / `401` |
+Other commands:
 
-The key guards were checked by breaking them on purpose. Removing the `processing` guard, ignoring the redelivered flag, republishing regardless of queue depth, or counting transient errors as crashes each makes the matching tests fail.
+```bash
+make test-unit      # Unit tests only
+make alerts-check   # Test Prometheus alert rules
+make smoke          # Verify the complete credit flow
+```
 
-Also checked by hand on the Docker stack. Each drill ended with every balance exact, every `pending_credits` correct, and 0 credits failed, parked or stuck:
+### Key scenarios covered
 
-| Drill | Result |
+| Scenario | Expected behavior |
 |---|---|
-| RabbitMQ stopped while 2,000 credits arrive | All got `202` in about 6s; all applied within 10s of RabbitMQ returning |
-| RabbitMQ restarted with 500 messages queued (workers stopped) | All 500 survived the restart and were applied (durable queue, persistent messages) |
-| Worker `SIGKILL`ed 6 times while processing 8,000 credits | All applied in 17s after the last restart; 10 credits really crashed mid-processing and were still applied once |
-| MongoDB killed for 30s, then for 150s, while processing | Workers paused, then resumed on their own; all applied |
-| MongoDB restarted | Balances identical before and after |
-| Workers stopped with 3,000 credits queued | Nothing republished past the threshold; 0 duplicate deliveries |
+| Valid credit | Balance updated, status processed |
+| Duplicate API request | Same credit returned; no additional balance change |
+| Duplicate RabbitMQ delivery | Balance updated only once |
+| Worker crashes after commit | Redelivery does not duplicate the credit |
+| MongoDB commit response lost | Safe recovery without a second balance update |
+| RabbitMQ unavailable | Saved credit is dispatched after recovery |
+| MongoDB temporarily unavailable | Credit remains pending and is retried |
+| Concurrent credits | Exact balance and pending count |
+| Repeated worker crashes | Credit parked for investigation |
+| Group commit | Multiple credits settled together without double processing |
+| Excessive requests | `429` or `503` before accepting new work |
 
-## Decisions and assumptions
+The tests also verify accounting invariants during concurrent processing:
 
-- **Durability is pinned in the code, not inherited from the cluster:** writes are acknowledged only after a majority has journaled them (`w: majority, j: true`), and transactions read at `snapshot`. Every MongoDB operation has a 10s client-side timeout, so a server that vanishes can't hang a worker on a dead connection (see [Time limits](#time-limits)).
-- **Money uses `Decimal`** in Python and `Decimal128` in MongoDB, never floats. The API returns money as strings (`"150.00"`). The example in the brief shows a number, so this is a deliberate difference.
-- **Credits for unknown users are rejected** with `404`. Accounts aren't created implicitly. `make seed` creates demo users.
-- **Each credit has its own status in `credit_operations`, and that is the authoritative status.** The user's `status` is `processing` while any credit is in flight. Once none are, it shows the outcome of the last one to finish.
-- **The credit document is also the outbox.** The API still publishes directly, as the brief asks. The dispatcher only handles credits whose publish wasn't confirmed, so there's no separate outbox table or relay service.
-- **The API uses synchronous handlers on purpose.** PyMongo and Celery publishing are blocking calls, so FastAPI runs the handlers in its threadpool and the event loop isn't blocked.
-- **Authentication is a minimal API key.** There's no rule about which client may credit which user; that would come from the real platform's identity model. Idempotency keys are unique per client and are kept as part of the audit record.
-- **MongoDB 8.2, not 8.0.** Current 8.0.x builds refuse to start on Linux kernels 6.19 and later ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)), and recent Docker Desktop VMs use those kernels.
+```text
+Current balance = Opening balance + Sum of processed credits
 
-## Known limits and production deployment
-
-- **A very busy single account.** Group commit roughly doubled how fast one account settles: on the same laptop, back to back, it went from 76 to 145 credits/s, and 2,487 instead of 1,465 out of 3,000 were accepted before `429`. A 3,000-credit backlog across 50 users settled in 50 transactions. The remaining limit is on the accept side: step 2 of the brief updates the user document for every accepted credit, which caps one account at about 170–210 accepted requests/s here. `429` keeps that account's backlog bounded. Going further would mean splitting a hot account's balance across several documents, or not touching the user document when a credit is accepted. Both change the brief's data contract, so they're documented rather than built.
-- **Measured locally:** about 315 requests/s accepted across 100 users, with 1 API process and 4 workers. That's a laptop number, not a capacity guarantee. Production capacity would come from running more API and worker instances, and should be benchmarked on real hardware.
-- **Security (the defaults here are for local demonstration only):** the `local-dev-key` API key, RabbitMQ's `guest/guest` login and the MongoDB instance without authentication exist so reviewers can run everything with one command, and compose publishes the MongoDB and RabbitMQ ports only so you can inspect them. Production would put the API behind an identity provider (OAuth2 or mTLS at a gateway), authorise which clients may credit which users, load credentials from a secrets manager, use TLS on every connection, and keep the broker and database on a private network.
-- **High availability:** production needs a 3-node replica set with majority writes, RabbitMQ quorum queues, several API and worker instances, and a single beat (concurrent dispatchers are safe, but you only need one).
-- **Retention:** credit records are the audit trail and shouldn't be deleted by a TTL. They would be archived according to a retention policy, with a reconciliation job that checks balances against processed credits.
-
-## Configuration
-
-These environment variables are read by the API, the worker and beat. Local runs also read a `.env` file (see `.env.example`).
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MONGO_URI` / `MONGO_DB` | localhost replica set / `credit_service` | Must point to a replica set (needed for transactions) |
-| `MONGO_OPERATION_TIMEOUT_MS` / `API_DB_DEADLINE_SECONDS` | `10000` / `10` | Limit per MongoDB operation, and total MongoDB time per API request (see Time limits) |
-| `BROKER_URL` / `CREDITS_QUEUE` | local RabbitMQ / `credits` | |
-| `API_KEYS` | empty (auth off) | `client:key,...`; compose sets `reviewer:local-dev-key` |
-| `MAX_PENDING_PER_USER` / `MAX_QUEUE_DEPTH` | `1000` / `100000` | Admission limits (`429` / `503`) |
-| `PUBLISH_PAUSE_SECONDS` | `5` | How long the API stops publishing after a failed publish |
-| `TASK_MAX_RETRIES` / `RETRY_BACKOFF_SECONDS` / `RETRY_BACKOFF_MAX_SECONDS` | `5` / `1` / `60` | Retries for transient errors |
-| `MAX_CRASHES` / `TASK_TIME_LIMIT_SECONDS` | `10` / `300` | Crashes before a credit is parked for an operator, and the hard time limit per task |
-| `APPLY_BATCH_SIZE` | `100` | Pending credits of one user settled together in one transaction (group commit); `1` turns it off |
-| `DISPATCH_INTERVAL_SECONDS` / `DISPATCH_TIME_BUDGET_SECONDS` / `DISPATCH_BATCH_SIZE` | `15` / `10` / `500` | How often the dispatcher runs, how long each run may take, and the batch size |
-| `PUBLISH_GRACE_SECONDS` / `REPUBLISH_AFTER_SECONDS` / `RECONCILE_MAX_QUEUE_DEPTH` | `10` / `900` / `100` | When unconfirmed and confirmed credits become due, and the queue depth below which confirmed credits may be republished |
-| `DISPATCH_LEASE_SECONDS` | `60` | How long a dispatcher's claim lasts |
-| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` | Use `console` for readable local logs |
-
-## Project layout
-
+Pending credits = Number of unsettled credit operations
 ```
+
+### Failure-recovery verification
+
+The following scenarios were also tested on the local Docker environment:
+
+- RabbitMQ unavailable while 2,000 credits were accepted.
+- RabbitMQ restarted with 500 queued messages.
+- Worker terminated repeatedly while processing 8,000 credits.
+- MongoDB unavailable for 30 seconds and 150 seconds.
+- A backlog of 3,000 queued credits.
+- Concurrent processing, duplicate delivery, and recovery after uncertain commits.
+
+These drills completed with exact balances and without stranded credits.
+
+The CI workflow in `.github/workflows/ci.yml` runs code quality checks, type checking, tests, image builds, and smoke tests. It also validates the Prometheus alert rules.
+
+## Project Structure
+
+```text
 src/credit_service/
-  api/              FastAPI app, routes, schemas, auth, error mapping, health, metrics
-  services.py       credit workflows: admission, failure policy, dispatcher (no FastAPI/Celery)
-  repository.py     MongoDB queries and transactions
-  worker.py         Celery tasks: apply_credit, dispatch_pending_credits
-  celery_app.py     Celery/RabbitMQ configuration, publishing, queue-depth probe
-  money.py          amount parsing and validation
-  unpark.py         operator command that releases parked credits
-  db.py, models.py, errors.py, config.py, observability.py, seed.py
-ops/                Prometheus alert rules and their promtool unit tests
-tests/unit/         pure logic: money, backoff, error classification
-tests/integration/  real MongoDB + RabbitMQ, including an in-process Celery worker
+├── api/                  # FastAPI routes, validation, auth, health, metrics
+├── services.py           # Credit workflows and business rules
+├── repository.py         # MongoDB queries and transactions
+├── worker.py             # Celery background tasks
+├── celery_app.py         # RabbitMQ and Celery configuration
+├── money.py              # Decimal validation
+├── models.py             # Data models and statuses
+├── db.py                 # MongoDB connections and indexes
+├── config.py             # Environment configuration
+├── errors.py             # Application errors
+├── observability.py      # Structured logging
+├── seed.py               # Demo users
+└── unpark.py             # Operator recovery command
+
+tests/
+├── unit/                 # Validation and retry logic
+└── integration/          # Real database, broker and worker tests
+
+ops/                      # Prometheus alerts and alert tests
+scripts/                  # Smoke test
+docs/                     # Architecture and design document
+
+compose.yml               # Local infrastructure
+Dockerfile                # Application image
+Makefile                  # Development commands
+pyproject.toml            # Dependencies and tooling
+uv.lock                   # Locked dependency versions
 ```
+
+The application separates HTTP handling, business workflows, database operations, and background task execution. Business logic is shared between the API and worker rather than duplicated.
+
+## Production Considerations
+
+The application implements production-oriented reliability mechanisms, but the included Docker Compose environment is intended for local development and demonstration.
+
+Before handling real financial traffic, the deployment would require:
+
+- **High availability:** Multi-node MongoDB replica set, RabbitMQ quorum queues, and multiple API and worker instances.
+- **Security:** Production authentication and authorization, TLS, secrets management, and private database and broker networking.
+- **Monitoring:** Connect the existing metrics and alert rules to a production monitoring and notification system.
+- **Data operations:** Backups, restore drills, retention policies, and balance reconciliation.
+- **Capacity validation:** Sustained load testing, infrastructure failover testing, and production-specific performance tuning.
+
+The existing group commit implementation reduces contention when many credits target the same account. However, the API still updates the user document for every accepted credit, which remains a throughput constraint for extremely busy accounts.
+
+Local benchmarks are not production capacity guarantees.
+
+For the full architecture, implementation rationale, testing strategy, and trade-offs, see the **[two-page design document](docs/design.pdf)**.
+
+---
+
+**Design principle:** Accept each credit durably, apply it at most once, and retain recoverable state until it reaches a valid outcome.
